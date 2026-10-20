@@ -279,10 +279,17 @@ class TestMonokernelFault(CustomTestCase):
                 log = err.read() + out.read()
                 # a launch never runs on after a failed wait: it stops with a store
                 # to the null page, so the only faults are at address 0x0, none on
-                # words that never came
-                faults = re.findall(r"faulting addr: (0x[0-9a-fA-F]+)", log)
-                self.assertTrue(faults, log[-2000:])
-                self.assertEqual(set(faults) - {"0x0"}, set(), faults)
+                # words that never came (ROCm prints "faulting addr: 0x0", "on
+                # address (nil)", or no address at all)
+                faults = re.findall(
+                    r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))", log
+                )
+                if faults:
+                    self.assertEqual(set(faults) - {"0x0", "(nil)"}, set(), faults)
+                else:
+                    self.assertIn(
+                        "an illegal memory access was encountered", log, log[-2000:]
+                    )
             finally:
                 terminate_and_kill_process_tree(process)
 
