@@ -541,6 +541,8 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         "sym": own,
         "args": {n: a[n] for n in seam_args} | {"norm_w": a["ffn_w"]},
         "d": StageDims(tp),
+        # SGLang's Triton boundary + rmsnorm arithmetic (seam.slice_row, stage_norm)
+        "sgl": True,
     }
     normed = scratch + fx.Int64(layout["normed"][0])
     for region in ("lin", "pmix"):
