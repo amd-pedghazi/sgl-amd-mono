@@ -13,6 +13,7 @@ from check_ffn import (
     HC_EPS,
     HIDDEN,
     RMS_EPS,
+    captured_growth,
     finish,
     make_weights,
     mono_weights,
@@ -263,9 +264,11 @@ def main():
             torch.cuda.synchronize()
             if rank == 0:
                 print(k1_timeline(M, r.timeline(M).cpu()), flush=True)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            launch()
+        # the k1 launch's outputs; a control graph copies them without the launch
+        outs = [r.q[:M], r.res_mid[:M], r.post_a[:M], r.comb_a[:M], r.pre_a[:M]]
+
+        control, _ = captured_growth(lambda: [d.copy_(d) for d in outs], dev)
+        capture, graph = captured_growth(launch, dev)
         diff = dict(res=0, x8=0, x8s=0, nope=0, scale=0, rope=0, replay=0, normed=0)
         mix, q_cos, q_rel, qr_rel = 0.0, 1.0, 0.0, 0.0
         for _ in range(args.trials):
@@ -385,15 +388,24 @@ def main():
                 q_cos, torch.nn.functional.cosine_similarity(qk, qr, dim=0).item()
             )
             q_rel = max(q_rel, ((qk - qr).norm() / qr.norm()).item())
+        # replays allocate nothing beyond the first (RFC section 9)
+        graph.replay()
+        torch.cuda.synchronize()
+        base_alloc = torch.cuda.memory_allocated(dev)
+        for _ in range(64):
+            graph.replay()
+        torch.cuda.synchronize()
+        replays = torch.cuda.memory_allocated(dev) - base_alloc
         del graph
         bad = ([] if ok else ["wqkv route"]) + [k for k, v in diff.items() if v]
+        bad += ["allocator"] if capture > control or replays > 0 else []
         bad += (["mix"] if mix > MIX_TOL else []) + (
             ["q"] if q_cos < Q_COS or q_rel > Q_REL else []
         )
         bad += ["qr"] if qr_rel > QR_REL else []
         if rank == 0:
             print(f"M={M:2d} {vname:7s} {'PASS' if not bad else 'FAIL ' + ','.join(bad)} | qr rel {qr_rel:.1e} | wqkv_a {route} | differing: "
-                  f"{diff} | pre/post/comb max|d| {mix:.2e} (bound {MIX_TOL:.0e}) | q cos {q_cos:.7f} "
+                  f"{diff} alloc(cap {capture} ctrl {control} rep {replays}) | pre/post/comb max|d| {mix:.2e} (bound {MIX_TOL:.0e}) | q cos {q_cos:.7f} "
                   f"rel {q_rel:.2e}", flush=True)  # fmt: skip
         fails += [f"M={M} {vname} {b}" for b in bad]
     finish(fails, dev)

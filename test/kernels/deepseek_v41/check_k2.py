@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from check_ffn import (
     HIDDEN,
     bf16_ulps,
+    captured_growth,
     cos,
     deq_fp8_block,
     finish,
@@ -391,9 +392,13 @@ def main():
     run_all()
     torch.cuda.synchronize()
     eager = [t.clone() for s in steps for t in s[-1]]
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_all()
+
+    # the same output copies without the launches: what torch's capture itself allocates
+    control, _ = captured_growth(
+        lambda: [d.copy_(d) for s in steps for d in s[-1]], dev
+    )
+    capture, graph = captured_growth(run_all, dev)
+    after_capture = torch.cuda.memory_allocated(dev)
     bad_replays = 0
     for i in range(args.replays):
         graph.replay()
@@ -401,11 +406,19 @@ def main():
             torch.cuda.synchronize()
             got = [t for s in steps for t in s[-1]]
             bad_replays += sum(not torch.equal(a, b) for a, b in zip(got, eager))
+    torch.cuda.synchronize()
+    replays = torch.cuda.memory_allocated(dev) - after_capture
     if rank == 0:
         print(f"replay check: {args.replays} replays of widths {WIDTHS} in one graph: "
-              f"{bad_replays} mismatching checks", flush=True)  # fmt: skip
+              f"{bad_replays} mismatching checks; allocator capture {capture} B (control {control}), "
+              f"replays {replays} B", flush=True)  # fmt: skip
     if bad_replays:
         fails.append("replay")
+    # A replay may release memory; only an increase is growth.
+    if capture > control or replays > 0:
+        fails.append(
+            f"allocator grew: capture {capture} (control {control}), replays {replays}"
+        )
     finish(fails, dev)
 
 

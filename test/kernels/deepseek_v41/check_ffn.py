@@ -305,6 +305,18 @@ def timeline_report(M, tl) -> str:
     return "\n".join(lines)
 
 
+def captured_growth(fn, dev):
+    """(bytes the allocator grew during a capture of fn, the graph). check_k1 and check_k2
+    import it, so all three files measure a graph capture the same way."""
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated(dev)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    torch.cuda.synchronize()
+    return torch.cuda.memory_allocated(dev) - before, g
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=500)
@@ -411,9 +423,11 @@ def main():
     run_all()
     torch.cuda.synchronize()
     ref = [t.clone() for s in steps for t in s[5]]
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_all()
+
+    # the same output copies without the launches: what torch's capture itself allocates
+    control, _ = captured_growth(lambda: [d.copy_(d) for s in steps for d in s[5]], dev)
+    capture, graph = captured_growth(run_all, dev)
+    after_capture = torch.cuda.memory_allocated(dev)
     bad_replays = 0
     for i in range(args.replays):
         graph.replay()
@@ -421,12 +435,20 @@ def main():
             torch.cuda.synchronize()
             got = [t for s in steps for t in s[5]]
             bad_replays += sum(not torch.equal(a, b) for a, b in zip(got, ref))
+    torch.cuda.synchronize()
+    replays = torch.cuda.memory_allocated(dev) - after_capture
     if rank == 0:
         print(f"replay check: {args.replays} replays of widths {WIDTHS} in one graph, outputs sampled "
-              f"every 50 replays: {bad_replays} mismatching checks",
+              f"every 50 replays: {bad_replays} mismatching checks; allocator capture {capture} B "
+              f"(control {control}), replays {replays} B",
               flush=True)  # fmt: skip
     if bad_replays:
         fails.append("replay")
+    # A replay may release memory; only an increase is growth.
+    if capture > control or replays > 0:
+        fails.append(
+            f"allocator grew: capture {capture} (control {control}), replays {replays}"
+        )
     finish(fails, dev)
 
 
