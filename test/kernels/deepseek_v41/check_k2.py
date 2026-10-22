@@ -24,7 +24,7 @@ from check_ffn import (
     seam_inputs,
 )
 
-from sgl_amd_mono.deepseek_v41.spec import NUMERICS
+from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 HEAD_DIM, NOPE, ROPE = 512, 448, 64
 DATA, SCALE_BYTES, REC = 576, 8, 584
@@ -33,7 +33,7 @@ O_RANK = 1024
 SWA_BLOCK, COMP_BLOCK = 64, 128
 SWA_PAGES, COMP_PAGES = 48, 32
 POSITIONS = 4096
-WIDTHS = (1, 6, 12, 24, 48)
+WIDTHS = SPEC.devices["gfx950"].widths  # every width the spec builds
 
 
 def page_bytes(block):

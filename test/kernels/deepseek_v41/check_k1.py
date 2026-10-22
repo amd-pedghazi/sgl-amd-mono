@@ -19,7 +19,7 @@ from check_ffn import (
     seam_inputs,
 )
 
-from sgl_amd_mono.deepseek_v41.spec import NUMERICS
+from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 RECORD, BLOCK, PAGES, POSITIONS = 584, 64, 64, 131072
 Q_RANK, NOPE, HEAD = 1280, 448, 512
@@ -27,7 +27,8 @@ Q_RANK, NOPE, HEAD = 1280, 448, 512
 MIX_TOL = NUMERICS.bound("k1.mix.max_abs")
 # K1 rounds q as SGLang does but sums wq_b in another order: bf16 flips only
 Q_COS, Q_REL = NUMERICS.bound("k1.q.cosine"), NUMERICS.bound("k1.q.rel")
-WIDTHS = "1,2,3,4,5,7,8,12,16,17,24,31,32,33,40,47,48"
+# every width the spec builds
+WIDTHS = ",".join(str(m) for m in SPEC.devices["gfx950"].widths)
 # (name, fold, index, first): the variants, each against its SGLang chain
 VARIANTS = (
     ("fold", True, False, False),

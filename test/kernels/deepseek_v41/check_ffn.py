@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sgl_amd_mono.deepseek_v41.spec import NUMERICS
+from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 HIDDEN, HC, MIX = 5120, 4, 24
 E, TOPK, SCALE, LIMIT = 384, 6, 1.5, 10.0
@@ -17,7 +17,7 @@ E, TOPK, SCALE, LIMIT = 384, 6, 1.5, 10.0
 DRAFT_ROUTE = dict(experts=128, topk=3, ug_groups=1)
 DRAFT_WIDTHS = (5, 10, 15, 20, 25, 30, 35, 40)
 INTER, PAD = 2304, 128
-WIDTHS = (1, 2, 4, 8, 12, 16, 24, 32, 40, 48)  # every decode graph width <= 48
+WIDTHS = SPEC.devices["gfx950"].widths  # every width the spec builds
 RMS_EPS, HC_EPS = 1e-20, 1e-6
 MIX_RTOL = NUMERICS.bound("ffn.mix.rel")
 FP4 = [
