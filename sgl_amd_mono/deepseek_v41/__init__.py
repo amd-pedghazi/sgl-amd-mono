@@ -30,7 +30,6 @@ HF_CONFIG = dict(
     q_lora_rank=1280,
     qk_rope_head_dim=64,
     sliding_window=128,
-    # the indexer K2i scores: 32 heads of 128 dims, and its top-512 rows
     index_topk=512,
     index_n_heads=32,
     index_head_dim=128,

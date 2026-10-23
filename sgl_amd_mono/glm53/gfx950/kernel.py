@@ -201,10 +201,12 @@ def build_glm5_monokernel(
     ``index_paged=True`` keeps the index keys in SGLang's paged FP8 cache: per
     block, ``index_block_size x 128`` E4M3 values (``index_shuffled``: 16-token x
     16-byte tiles) followed by one power-of-two f32 scale per token, with blocks
-    ``index_block_bytes`` apart.  Every row is its own request: ``req_ids`` picks
-    its ``block_table`` row (rows ``bt_stride`` entries apart, a launch argument),
-    keys cover positions ``0 .. positions[s]``, and the top-k is published as
-    global cache slots to ``out_indices`` at the row's ``sparse_kv_indptr`` offset.
+    ``index_block_bytes`` apart.  ``req_ids`` picks each row's ``block_table`` row
+    (rows ``bt_stride`` entries apart, a launch argument; the rows of one verify
+    request may share it), keys cover positions ``0 .. positions[s]``, a key that
+    a row of this launch writes is scored from that row's ``index_k_new`` pair, and
+    the top-k is published as global cache slots to ``out_indices`` at the row's
+    ``sparse_kv_indptr`` offset.
     ``index_k_bf16`` reads the index K projection as packed bf16.
 
     ``dense_experts > 0`` runs a dense MLP instead of the MoE: its intermediate
@@ -2644,6 +2646,10 @@ def build_glm5_monokernel(
                 )
                 return fx.Uint32(radix_key(bits))
 
+            # A key this launch writes (a verify row's earlier drafts, its own) is
+            # read from its row's index_k_new pair; the cache store is not yet visible.
+            new_active = [row_writes_cache(n) for n in range(S)]
+            new_slots = [row_slot(n) for n in range(S)]
             for s in range_constexpr(S):
                 bound = index_bound(s)
                 req = index_request(s)
@@ -2681,7 +2687,12 @@ def build_glm5_monokernel(
                     head = head_group * 16 + lane % 16
                     block = index_block(req, safe_key)
                     off = safe_key % index_block_size
-                    is_new = safe_key == pos
+                    key_slot = block * index_block_size + off
+                    new_row = fx.Int32(-1)
+                    for n in range_constexpr(S):
+                        hit = new_active[n] & (key_slot == new_slots[n])
+                        new_row = hit.select(fx.Int32(n), new_row)
+                    is_new = new_row >= 0
                     k_scale = is_new.select(
                         fx.Float32(1.0),
                         ld_f32(r_index_cache, index_scale_word(block, off)),
@@ -2702,7 +2713,10 @@ def build_glm5_monokernel(
                         if is_new:
                             kv_pairs = get_bf2_many(
                                 [
-                                    (mb("index_k_new"), s * INDEX_DIM + k + j * 2)
+                                    (
+                                        mb("index_k_new"),
+                                        new_row * INDEX_DIM + k + j * 2,
+                                    )
                                     for j in range(4)
                                 ]
                             )

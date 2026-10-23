@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Device primitives of K1's attention front, adapted from ATOM's mono decode framework."""
+"""Device primitives of K1's attention front and K2's back, adapted from ATOM's
+mono decode framework."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -12,7 +13,7 @@ from flydsl.expr.typing import T, as_ir_value
 from sgl_amd_mono.common.ops import bf16_pair, rsrc
 from sgl_amd_mono.common.sync import _spin
 
-# The execution model: one CTA a CU of an MI355X, all resident.
+# the execution model: one CTA a CU of an MI355X, all resident
 BLOCKS = 256
 THREADS = 512
 WAVES = THREADS // 64

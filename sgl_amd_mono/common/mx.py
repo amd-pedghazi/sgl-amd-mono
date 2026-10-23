@@ -45,7 +45,7 @@ def scale_index(row, col, cols):
 
 
 def fp4_tile_load(r_w, base, rg, k, st, at):
-    """Load a lane's 16 B of an FP4 weight's (16, 16)-shuffled row group at step ``st`` (nontemporal)."""
+    """Load a lane's 16 B of an FP4 weight's (16, 16)-shuffled row group at step ``st``."""
     return fx.Vector(
         bo.buffer_load(
             r_w,

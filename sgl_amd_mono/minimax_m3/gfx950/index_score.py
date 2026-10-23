@@ -2,19 +2,14 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Indexer block scores for K4's sparse selection (``select_blocks`` polls them).
 
-The unfused decode scorer's math, one 128-key block of index-K per task: bf16(fp8
-K) x bf16 index q on the MFMA, max over the causal keys, times fp32(sm_scale *
-log2 e). A context of <= TOPK_BLOCKS blocks keeps every block and is not scored;
-nor are the blocks the selector pins (the first ``init_blocks``, the last
-``local_blocks``): their keys are forced. A scored block waits for the index keys
-K1 inserts this step only when it may hold one (``wait_new_keys``).
-
-A task is one block of one request and runs on one wave: the request's q tokens
-(a speculative verify's rows) are the MFMA's B columns, so the block's index-K is
-read once for all of them, and no task needs the CTA (no barrier).
-
-Emitted at the end of K1 (``emit_index_scores``), which makes index q: K4's
-selector then finds the scores in place instead of scoring after its launch.
+The unfused decode scorer's math, one 128-key block of index-K per task: bf16(fp8 K) x
+bf16 index q on the MFMA, max over the causal keys, times fp32(sm_scale * log2 e). A
+task is one block of one request, whose q tokens (a speculative verify's rows) are the
+MFMA's B columns, so the block's index-K is read once for all of them. A context of
+<= TOPK_BLOCKS blocks keeps every block and is not scored, nor are the blocks the
+selector pins (the first ``init_blocks``, the last ``local_blocks``): their keys are
+forced. Emitted at the end of K1 (``emit_index_scores``), which makes index q, so K4's
+selector finds the scores in place.
 """
 
 import struct
@@ -122,34 +117,30 @@ def emit_index_scores(
     wait_new_keys, prepare, heads=ONE_INDEX_HEAD, q_frag_head=None,
     prepare_heads=None,
 ):  # fmt: skip
-    """This CTA's (``slot``) share of the step's score tasks: up to BLOCKS tasks,
-    task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA u % BLOCKS
-    (``red``: WAVES * 16 floats of LDS). The tokens form requests of ``q_len``
-    consecutive rows sharing a block table; the last one has the longest context
-    and lists the request's scored blocks. ``q_frag(k, s)``: this lane's B operand
-    for token k, k-chunk s (bf16x8 of index q). Pair k * MAX_INDEX_BLOCKS + b of
-    mailbox ``iscore`` <- the score of token k's block b.
+    """This CTA's (``slot``) share of the step's score tasks: pair k * MAX_INDEX_BLOCKS
+    + b of mailbox ``iscore`` <- the score of token k's block b.
 
-    ``wait_new_keys()`` (wave-local) waits for the index keys this launch
-    inserts: a block within MAX_TOKENS keys of a token's end may hold an earlier
-    token of its request (speculative decode rows). ``prepare(first, last)``
-    (with CTA barriers) runs on a CTA with tasks before any index q is read: K1
-    makes rows first..last's there.
-
-    Indexer context parallelism (``heads.count`` > 1): a long request
-    (``step_rows``) scores only this rank's blocks, b = heads.own
-    (mod TP) -- every index q head of them, a task's key block read once for all:
-    pair k * MAX_INDEX_BLOCKS + h * (MAX_INDEX_BLOCKS / TP) + b / TP <- the score
-    of token k's block b for head h. ``q_frag_head(k, s, h)``: head h's B operand
-    (every lane its own h); ``prepare_heads()`` (with CTA barriers, on every CTA)
-    makes those requests' rows' heads first. The other requests score as above."""
+    Up to BLOCKS tasks, task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA
+    u % BLOCKS (``red``: WAVES * 16 floats of LDS). The tokens form requests of
+    ``q_len`` consecutive rows sharing a block table; the last has the longest context
+    and lists the request's scored blocks. ``q_frag(k, s)``: this lane's B operand for
+    token k, k-chunk s (bf16x8 of index q). ``wait_new_keys()`` (wave-local) waits for
+    the index keys this launch inserts, which a block within MAX_TOKENS keys of a
+    token's end may hold (a speculative verify's earlier rows).
+    ``prepare(first, last)`` (with CTA barriers) runs on a CTA with tasks before any
+    index q is read: K1 makes rows first..last's there. Under indexer context
+    parallelism (``heads.count`` > 1) a long request (``step_rows``) scores only this
+    rank's blocks, b = heads.own (mod TP), for every index q head, a key block read
+    once for all: pair k * MAX_INDEX_BLOCKS + h * (MAX_INDEX_BLOCKS / TP) + b / TP <-
+    token k's block b for head h. ``q_frag_head(k, s, h)`` is head h's B operand
+    (every lane its own h), and ``prepare_heads()`` (with CTA barriers, on every CTA)
+    makes those requests' rows' heads first."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
     l16 = lane % 16
     g4 = lane // 16
     rows = step_rows(seq_lens, tokens, q_len, heads)
     seq = rows.seq
-    # every request's scored blocks in one list, a task per wave across the grid;
-    # context-parallel requests' (this rank's blocks) in a second
+    # one task list of every request's scored blocks, and one of CP requests' own blocks (pre_cp)
     cp = heads.count > 1
     first_own = init_blocks + (heads.own - init_blocks) % TP
     pre = [fx.Int32(0)]
@@ -194,11 +185,13 @@ def emit_index_scores(
         return col, _pick(seq, col)
 
     def load_raw(page, tiles):
-        """Key tiles ``tiles`` (16 keys each) of a block, in flight: lane g4 =
-        lane / 16 reads its key's bytes 32 g4 .. 32 g4 + 32 with two 16 B loads
-        (half the load instructions of eight-byte operand reads scattered over
-        the rows); ``split_tiles`` makes them MFMA operands. ``page`` is uniform:
-        a 64-bit base at it keeps the offsets 32-bit for a cache of any size."""
+        """Key tiles ``tiles`` (16 keys each) of a block, in flight; ``split_tiles``
+        makes them MFMA operands.
+
+        Lane g4 = lane / 16 reads its key's bytes 32 g4 .. 32 g4 + 32 with two 16 B
+        loads, half the load instructions of eight-byte operand reads scattered over
+        the rows. ``page`` is uniform: a 64-bit base at it keeps the offsets 32-bit for
+        a cache of any size."""
         r_ic = rsrc(index_cache + fx.Int64(page) * INDEX_BLOCK_BYTES)
         words = []
         for i in tiles:
@@ -267,8 +260,7 @@ def emit_index_scores(
             if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                 wait_new_keys()
             kw = split_tiles(load_raw(page, tiles), tiles)
-            # every pass unrolled, the unused ones skipped: a runtime pass loop
-            # slows the whole kernel's short contexts
+            # passes unrolled, unused ones skipped: a runtime pass loop slows every short context
             for p in range_constexpr(TP * MAX_TOKENS // 16):
                 if p * 16 < n_cols:
                     f = p * 16 + l16
@@ -285,8 +277,7 @@ def emit_index_scores(
                             v * scale,
                         )
 
-        # as the wave mode below: task u on wave (u // BLOCKS) % WAVES of CTA
-        # u % BLOCKS, lane j decoding task c0 + step j
+        # the same task placement and per-lane decode as the wave mode below
         step = BLOCKS * WAVES
         for c0 in range(slot + BLOCKS * wave, total_cp, step * 64):
             c0 = fx.Int32(c0)
@@ -298,12 +289,7 @@ def emit_index_scores(
                 i = fx.Int32(i)
                 score_cp(readlane(tk_j, i), readlane(b_j, i), readlane(pages, i))
 
-    # Up to BLOCKS tasks: one a CTA, a key tile a wave, the columns' maxima met in
-    # LDS; the keys go out before prepare() (only the task's request's rows), so
-    # their latency hides under the index q's: the scores are on the step's
-    # critical path. More: a task a wave,
-    # every row's index q first (a wave's task count differs: no barrier inside),
-    # the pages of a wave's next 64 tasks fetched at once, a lane each.
+    # a task a CTA, a key tile a wave; its keys load before prepare(), hiding under the index q's
     if total <= BLOCKS:
         for u in range(slot, total, BLOCKS):
             tk, b = task_block(fx.Int32(u))
@@ -323,6 +309,7 @@ def emit_index_scores(
                     v = fx.max(v, fx.ptr_load(red + (w * 16 + l16)))
                 put(b, col, v)
             gpu.barrier()
+    # more: a task a wave, after every row's index q (wave task counts differ: no barrier inside)
     if total > BLOCKS:
         prepare(fx.Int32(0), fx.Int32(tokens - 1))
         tiles = range(KEY_TILES)
@@ -338,10 +325,7 @@ def emit_index_scores(
             qb = [q_frag(col, s) for s in range(HEAD_DIM // 32)]
             put(b, col, tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles)))
 
-        # Every wave the same task count: task u on wave
-        # (u // BLOCKS) % WAVES of CTA u % BLOCKS; lane j decodes task c0 + step j
-        # once -- token, block, page -- read back per task, so no select chain
-        # sits between one task's keys and the next.
+        # lane j decodes task c0 + step j once, read back per task: no select chain between tasks
         step = BLOCKS * WAVES
         for c0 in range(slot + BLOCKS * wave, total, step * 64):
             c0 = fx.Int32(c0)

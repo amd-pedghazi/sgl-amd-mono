@@ -284,7 +284,7 @@ def uniform_f32(value):
 
 
 def read_lane_i32(value, lane):
-    """Read one i32 from ``lane`` while keeping IR conversion local."""
+    """Lane ``lane``'s i32 ``value`` (v_readlane)."""
 
     return fx.Int32(rocdl.readlane(T.i32, fx.Int32(value), fx.Int32(lane)))
 
@@ -364,5 +364,5 @@ def mxfp4_to_bf16x8(word, scale):
 
 
 def hw_exp(value):
-    """Natural exponential using the same hardware exp2 and log2(e) scale."""
+    """e^x as the hardware exp2 of x * log2(e)."""
     return hw_exp2(fx.Float32(value) * 1.4426950408889634)

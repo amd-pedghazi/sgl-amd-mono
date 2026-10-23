@@ -11,7 +11,7 @@ from sgl_amd_mono.common.plan import Shard, padded
 
 # the model's full widths
 MOE_INTER = 2304  # a routed expert's intermediate width
-SHARED_INTER = 2304  # the shared expert's
+SHARED_INTER = 2304
 # the loader pads a routed expert's rank share to a multiple of this with zero weights
 MOE_PAD = 128
 ROWS = 16  # GEMV rows a task
@@ -33,7 +33,7 @@ class Dims(msgspec.Struct, frozen=True):
 
     @property
     def inter(self) -> int:
-        """... padded as the loader pads it (the rest zero weights)."""
+        """``inter_real`` padded as the loader pads it (the rest zero weights)."""
         return padded(self.inter_real, MOE_PAD)
 
     @property
@@ -52,5 +52,5 @@ class Dims(msgspec.Struct, frozen=True):
 
     @property
     def down_scale_cols(self) -> int:
-        """Return w2_s's E8M0 columns: inter / 32, padded to a multiple of 8."""
+        """Return ``w2_s``'s E8M0 columns."""
         return padded(self.inter // 32, 8)

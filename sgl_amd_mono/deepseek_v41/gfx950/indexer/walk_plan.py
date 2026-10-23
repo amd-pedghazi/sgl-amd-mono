@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # From sgl-project/sglang#43984 at 134919476c (kernels/ops/mono/gfx950/deepseek_v41/
 # indexer/walk_plan.py)
-"""The FP4 score stage's FULL-layer walk plan on the device: ATOM's host
-``index_plan.fill_walk_plan`` as one single-CTA Triton launch, so a replayed graph
-lays it out from the step's device bounds (no host round trip; the no-sync step
-has no CPU sequence lengths in time). ``[ctas, 4]`` int32 (lead, span, ch0, ch1)
-a CTA, zeros past the last task, equal to the host plan
-(``test/kernels/test_deepseek_v41_k2i.py``).
+"""The FULL-layer walk plan on the device: ATOM's host ``index_plan.fill_walk_plan`` in one CTA.
 
-``owners[t]``: the first row of row t's request -- the rows of one request share
-a page table, so a piece (up to WALK_ROWS adjacent rows of one owner) scores
-every row off one key load."""
+A replayed graph lays the plan out from the step's device bounds, since the no-sync step has no
+CPU sequence lengths in time; it equals the host plan (``test_deepseek_v41_k2i.py`` checks)."""
 
 import torch
 import triton
@@ -51,7 +45,7 @@ def _walk_plan_kernel(
     piece = tl.cumsum(lead.to(tl.int32), 0) - 1
     chunks = tl.where(row & (bound > TOPK), (bound + CHUNK - 1) // CHUNK, 0)
 
-    # per piece p (pieces in lead order; a dead one, need 0, gets no task)
+    # per piece p, in lead order; a dead piece (need 0) gets no task
     p = tl.arange(0, ROWS)
     member = (piece[None, :] == p[:, None]) & row[None, :]
     need = tl.max(tl.where(member, chunks[None, :], 0), 1)
@@ -90,8 +84,10 @@ def _walk_plan_kernel(
 def fill_walk_plan_device(
     *, bounds: torch.Tensor, owners: torch.Tensor, plan: torch.Tensor, rows: int
 ) -> None:
-    """``plan`` [ctas, 4] int32 <- the walk plan of ``rows`` rows (``bounds``, ``owners`` int32 on the device);
-    graph safe: one launch, no host reads."""
+    """``plan`` [ctas, 4] <- the walk plan of ``rows`` rows, graph safe: one launch, no host reads.
+
+    ``owners[t]`` is the first row of row t's request, whose rows share a page table, so a piece
+    of one owner scores every row off one key load."""
     assert 0 < rows <= MAX_ROWS, rows
     assert bounds.dtype == owners.dtype == plan.dtype == torch.int32
     assert plan.is_contiguous() and plan.shape[1] == 4 and plan.shape[0] % 64 == 0

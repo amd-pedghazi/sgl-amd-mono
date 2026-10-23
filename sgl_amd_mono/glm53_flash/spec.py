@@ -33,13 +33,23 @@ import os
 
 import msgspec
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.glm53_flash import (
@@ -81,6 +91,7 @@ SGLANG_READS = {
     "srt/environ.py": (
         "SGLANG_SIMULATE_UNIFORM_EXPERTS",
         "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
+        "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK",
     ),
     "srt/configs/model_config.py": ("context_len",),
     "srt/distributed/parallel_state.py": ("cpu_group",),
@@ -138,7 +149,7 @@ SGLANG_READS = {
         "lm_head",
         "forward(prev_topk_indices)",
     ),
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "DeviceLimits",
         "MonoSpec",
         "Numerics",
@@ -731,11 +742,14 @@ SPEC = MonoSpec(
             # benchmark routing overrides: the kernel routes with the model's own router
             "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
+            # the kernel breaks router ties in AITER's grouped top-k order, the path
+            # SGLang takes with this off; on, its Triton gate keeps the lower expert id
+            "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK": False,
         },
     ),
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
 )

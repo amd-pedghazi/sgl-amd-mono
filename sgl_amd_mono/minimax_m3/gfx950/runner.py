@@ -1,21 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One rank's MiniMax-M3 launches on gfx950: the buffers, the per-width kernels
-and the per-layer launch.
+"""One rank's MiniMax-M3 launches on gfx950: buffers, per-width kernels, per-layer launch.
 
-A sparse MoE layer is one launch: K1 (the input add and norm, the fused qkv /
-index projection, the q / k norms, RoPE, the K / V / index-K cache writes and the
-indexer scores) fused in front of K4 (the top-k block selection, sparse attention,
-o_proj, the router, the shared and routed MXFP4 experts and both all-reduces).
-A launch takes ``(ar, res)``, the all-reduced MLP output and the residual the
-decoder layer hands its input norm, and returns the next layer's pair. It reads
-the previous layer's (ar, h_mid) while it writes its own, so both alternate
-between two buffers by layer parity, baked into each layer's K1 arguments.
-
-Everything but the caches is allocated at construction, before SGLang sizes the
-KV cache. The caches and the request table are bound at the first forward
-(``bind``). Word 0 of the epoch buffer is the step: the host moves it on after a
-step's last launch, which keeps a layer's mailbox tags distinct from the same
-layer's one step earlier; words 1-5 are the guard block (``common/guard.py``).
+A sparse MoE layer is one launch: K1 (the input add and norm, the fused qkv / index
+projection, the q / k norms, RoPE, the K / V / index-K cache writes and the indexer
+scores) fused in front of K4 (the top-k block selection, sparse attention, o_proj, the
+router, the shared and routed MXFP4 experts and both all-reduces). A launch reads the
+previous layer's (ar, h_mid) while it writes its own, so both alternate between two
+buffers by layer parity, baked into each layer's K1 arguments. Everything but the
+caches is allocated at construction, before SGLang sizes the KV cache; the caches and
+the request table are bound at the first forward (``bind``). Word 0 of the epoch
+buffer is the step, which the host moves on after a step's last launch so a layer's
+mailbox tags differ from its tags one step earlier; words 1-5 are the guard block
+(``common/guard.py``).
 """
 
 from __future__ import annotations
@@ -39,8 +35,7 @@ from sgl_amd_mono.minimax_m3.gfx950.config import (
 
 FP8_CACHE = (torch.float8_e4m3fn, torch.uint8)
 
-# The SGLang names the runner reads, by file under the sglang package;
-# test/unit/test_contract.py pins them.
+# the SGLang names the runner reads, by file under sglang/; test_contract.py pins them
 SGLANG_READS = {
     "srt/mem_cache/memory_pool.py": (
         "get_key_buffer",
@@ -138,8 +133,7 @@ class M3MonoRunner:
         self.peers = PeerBuffer(sym + guard.FLAG_BYTES, cpu_group, rank, tp, device)
         self.peers.bytes.zero_()
         bf16 = torch.bfloat16
-        # row k = token k of the step; sparse layer i reads ars[i % 2] (the
-        # previous layer's output) and writes ars[(i + 1) % 2], likewise h_mids
+        # row k = token k; layer i reads ars[i % 2] and writes ars[(i + 1) % 2], likewise h_mids
         self.ars = [torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=device) for _ in range(2)]  # fmt: skip
         self.h_mids = [torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=device) for _ in range(2)]  # fmt: skip
         self.h = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=device)
@@ -172,11 +166,12 @@ class M3MonoRunner:
         compile_only(self.kernel(rows))
 
     def bind(self, backend, pool) -> None:
-        """The sparse layers' K / V / index-K caches (page16 SHUFFLE K / V, NHD
-        index-K, one KV head a rank), the request table, each layer's K1 arguments
-        that do not change per step, and the per-width row tables. The tables'
-        width is the backend's context, known only now: at most 4.5 MB (a 1M
-        context), after SGLang sized the KV cache."""
+        """Bind the caches, the request table, the K1 arguments and the per-width tables.
+
+        The caches: the sparse layers' page16 SHUFFLE K / V and NHD index-K, one KV head
+        a rank. The K1 arguments: each layer's pointers that do not change per step. The
+        row tables' width is the backend's context, known only now, after SGLang sized
+        the KV cache: at most 4.5 MB (a 1M context)."""
         from sgl_amd_mono.minimax_m3.gfx950.pre_attn import K1_ARGS
 
         no_capture("the caches bound")
@@ -201,8 +196,7 @@ class M3MonoRunner:
                 )  # fmt: skip
             )
         self.req_to_token = backend.req_to_token
-        # EAGLE reserves an extra allocator page for draft lookahead; it is not
-        # an increase to the configured context or the scores' capacity
+        # not the allocator's size: EAGLE's extra lookahead page adds no context or score capacity
         self.max_context_len = int(backend.max_context_len)
         self.bt_width = (self.max_context_len + SPARSE_BLOCK - 1) // SPARSE_BLOCK
         dev = self.device
@@ -289,9 +283,10 @@ class M3MonoRunner:
         tables: tuple,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sparse layer ``i`` (0: the first MoE layer) in a decoder layer's terms:
-        ``(ar, res)`` in, the next layer's ``(ar, h_mid)`` out. ``ar`` has to be in
-        ``ars[i % 2]``, where the previous launch left it; the copy is for the first
-        sparse layer, which the modules hand it."""
+        ``(ar, res)`` in, the next layer's ``(ar, h_mid)`` out.
+
+        ``ar`` has to be in ``ars[i % 2]``, where the previous launch left it; the copy
+        is for the first sparse layer, which SGLang's modules hand it."""
         L = self.layers[i]
         ar = self.ars[i % 2]
         if hidden.data_ptr() != ar.data_ptr():

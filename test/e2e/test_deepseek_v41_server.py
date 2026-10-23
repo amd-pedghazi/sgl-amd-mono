@@ -1,14 +1,10 @@
-"""DeepSeek-V4.1-Flash with --monokernel-backend amd on MI35x, TP4, across the switch
-points: verify steps with DSpark (8 requests of 6 rows at the largest width) and
-decode steps without it (48 rows). Each server's startup lines show its tested
-batches run the monokernels; batches step past the largest width and back (a short
-GSM8K run, for gross failures), and the tokens of covered steps are scored again by
-the normal prefill path (KL consistency) on short prompts. The DSpark server also
-runs prompts past the indexer's candidate span (its two-level steps), with a
-passkey to find there; decode steps run the same K2i launches. A fault on one rank
-stops the server before any token of the failed step is sent. Every backbone layer
-runs whole; the kernel checks cover each form of K1's input and each kind of K2i
-launch."""
+"""DeepSeek-V4.1-Flash with --monokernel-backend amd on MI35x, TP4, across the switch points.
+
+DSpark verify steps (8 requests of 6 rows at the largest width) and plain decode steps (48 rows):
+startup lines show the tested batches run the monokernels, GSM8K steps past the largest width and
+back, covered steps match the prefill path in KL, DSpark prompts past the candidate span
+(two-level steps) find a passkey, and a fault on one rank stops the server before any token of
+the failed step is sent."""
 
 import os
 import re
@@ -43,18 +39,15 @@ from sglang.test.test_utils import (
 from sgl_amd_mono import BACKEND
 
 LAUNCH_TIMEOUT = 3600
-# The normal path scores 0.88 to 0.91 on this recipe: the bound is for gross failures
+# the normal path scores 0.88 to 0.91 on this recipe: the bound is for gross failures
 GSM8K_BOUND = 0.85
-# Decode against prefill on 8 LongBench-v2 prompts, mean KL: about 0.007 on the
-# normal path, 0.011 with the monokernels (up to 0.022 for one prompt)
+# decode vs prefill mean KL on 8 LongBench-v2 prompts: ~0.007 normal, 0.011 mono (one prompt 0.022)
 KL_BOUND = 0.03
-# Prompts past the candidate span (2048 blocks of 8 positions): every step's index
-# sources run two-level. Their lengths, in tokens, and the bound on their mean KL:
-# about 0.026 on the normal path, 0.030 with the monokernels (DSpark; a prompt's
-# own KL ranges 0.0001 to 0.08 on either path)
+# past the candidate span (2048 blocks of 8 positions), so every step's index sources go two-level
 LONG_PROMPT_TOKENS = (18000, 21000, 24000, 27000)
+# mean KL ~0.026 normal, 0.030 mono (DSpark); per prompt 0.0001 to 0.08 on either path
 LONG_KL_BOUND = 0.06
-# long enough that most of its tokens come from decode or verify steps, not the prefill
+# long enough that most of the answer's tokens come from decode or verify steps, not the prefill
 PASSKEY = "4861372950"
 
 
@@ -87,7 +80,7 @@ def _long_prompts():
     """Long prompts of natural text: LongBench-v2 prompts (the KL test's, about
     3000 tokens each, cached) joined end to end."""
     ids = get_input_ids(tokenizer_path=MODEL, num_samples=48, trust_remote_code=True)
-    text = [t for p in ids for t in p]  # (the KL test's prompts carry no BOS)
+    text = [t for p in ids for t in p]  # the KL test's prompts carry no BOS
     out, at = [], 0
     for n in LONG_PROMPT_TOKENS:
         out.append(text[at : at + n])
@@ -133,8 +126,7 @@ class _Serving:
             log.close()
 
     def test_the_tested_batches_run_the_monokernels(self):
-        # routing is fixed at startup; without this, the other tests could pass on
-        # the normal path alone
+        # routing is fixed at startup; without this the other tests could pass on the normal path
         log = "".join(Path(f.name).read_text() for f in self.logs)
         for line in self.RUNS:
             self.assertIn(line, log)
@@ -154,8 +146,7 @@ class _Serving:
         self.assertGreater(metrics["accuracy"], GSM8K_BOUND)
 
     def test_covered_steps_match_prefill(self):
-        # 8 requests in one batch: every decode or verify step runs at a covered
-        # width, and the prefill that scores the tokens again is the normal path
+        # 8 requests keep every step at a covered width; the re-scoring prefill is the normal path
         assert_logprobs_match(
             DEFAULT_URL_FOR_TEST,
             {MODEL: {"kl_div": KL_BOUND}},
@@ -178,9 +169,7 @@ class TestMonokernelVerify(_Serving, CustomTestCase):
     )
 
     def test_long_prompts_match_prefill(self):
-        # past the candidate span every verify step is two-level: the candidate
-        # source scores the whole context and keeps its best blocks, the index
-        # sources after it score only those (K2i's three launch kinds)
+        # past the candidate span every verify step is two-level: all three K2i launch kinds
         prompts = _long_prompts()
         decoded = _logprobs(input_ids=prompts, max_new_tokens=128, logprob_start_len=-1)
         outputs = [
@@ -202,8 +191,7 @@ class TestMonokernelVerify(_Serving, CustomTestCase):
         )
 
     def test_passkey_past_the_candidate_span(self):
-        # a fact early in a prompt past the candidate span: the candidate source
-        # must keep its block for the index sources after it to read it
+        # the candidate source must keep the passkey's early block for later index sources to read
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         tok = get_tokenizer(MODEL, trust_remote_code=True)
@@ -241,8 +229,7 @@ class TestMonokernelDecode(_Serving, CustomTestCase):
 
 class TestMonokernelFault(CustomTestCase):
     def test_a_stalled_rank_stops_the_server_without_tokens(self):
-        # past startup (5000 launches), rank 1 stalls at its first wait; at the
-        # deadline (half the watchdog) it stops, and its peers stop on its flag
+        # after 5000 launches rank 1 stalls at its first wait; at half the watchdog all ranks stop
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
@@ -277,12 +264,17 @@ class TestMonokernelFault(CustomTestCase):
                 err.seek(0)
                 out.seek(0)
                 log = err.read() + out.read()
-                # a launch never runs on after a failed wait: it stops with a store
-                # to the null page, so the only faults are at address 0x0, none on
-                # words that never came
-                faults = re.findall(r"faulting addr: (0x[0-9a-fA-F]+)", log)
-                self.assertTrue(faults, log[-2000:])
-                self.assertEqual(set(faults) - {"0x0"}, set(), faults)
+                # a failed wait stops its launch with a null-page store: faults at 0x0 / (nil) only
+                faults = re.findall(
+                    r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))", log
+                )
+                if faults:
+                    self.assertEqual(set(faults) - {"0x0", "(nil)"}, set(), faults)
+                else:
+                    # ROCm may print no faulting address at all
+                    self.assertIn(
+                        "an illegal memory access was encountered", log, log[-2000:]
+                    )
             finally:
                 terminate_and_kill_process_tree(process)
 

@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Views of one sparse MoE layer, checked against what the kernels read.
 
-The kernels read tensors through raw pointers: a differently-laid-out weight
-would not fault, it would produce plausible garbage. So every assumption is
-checked once (``layer_reasons``, a refusal at startup) before the views are taken.
-
-Two kinds of tensor are copies rather than views of the original path:
-
-- The qkv / index projection and o_proj. The public Quark MiniMax-M3 export
-  leaves them in bf16, while the kernels' GEMVs are per-token-activation x
-  per-channel-weight FP8 on aiter's (16, 16) preshuffled layout. A copy is
-  quantized once per channel (amax / 448); the original weights are untouched.
-- The router gate, kept as bf16 (the kernels' GEMV is bf16; SGLang holds it in
-  fp32), and the routing bias as fp32.
-
-The MXFP4 expert tensors, the norms and the K / V scales are read in place.
+The kernels read tensors through raw pointers, where a differently laid out weight
+would not fault but give plausible garbage, so ``layer_reasons`` checks every
+assumption once, a refusal at startup, before the views are taken. The MXFP4 experts,
+the norms and the K / V scales are read in place. The copies: the qkv / index
+projection and o_proj, which the public Quark export leaves in bf16, quantized per
+channel (amax / 448) on aiter's (16, 16) preshuffled layout for the kernels'
+per-token x per-channel FP8 GEMVs; the router gate as bf16 for the kernels' bf16 GEMV
+(SGLang holds it in fp32); the routing bias as fp32.
 """
 
 from __future__ import annotations
@@ -36,8 +30,7 @@ from sgl_amd_mono.minimax_m3.gfx950.config import (
     qkv_rows,
 )
 
-# The SGLang names these views read, by file under the sglang package ("x": a
-# string literal); test/unit/test_contract.py pins them.
+# by file under sglang/ (``"x"``: a literal); test_contract.py pins them
 SGLANG_READS = {
     "srt/models/minimax_m3.py": (
         "self_attn",
@@ -187,8 +180,7 @@ def layer_reasons(layer, i: int) -> list[str]:
     # aiter's MXFP4 method marks its shuffled tensors; no mark is no shuffle
     if not (getattr(w13, "is_shuffled", False) and getattr(w2, "is_shuffled", False)):
         why.append(f"layer {i}: expert weights are not AITER-shuffled MXFP4")
-    # a SiTU activation makes SGLang interleave gate and up rows (A16W4), which
-    # also count as shuffled; the kernel reads them separated (A4W4)
+    # SiTU interleaves gate and up rows (A16W4), still marked shuffled; the kernel reads them apart
     activation = experts.moe_runner_config.activation
     if activation != "silu":
         why.append(f"layer {i}: expert activation {activation!r}, built for 'silu'")

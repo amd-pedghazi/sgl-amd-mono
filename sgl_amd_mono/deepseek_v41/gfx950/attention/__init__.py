@@ -1,3 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K1's attention front: wqkv_a, q / kv norms, the KV store and wq_b."""
+"""K1's attention front (wqkv_a, q / kv norms, the KV store, wq_b, the index query)
+and K2's attention back (split, combine, wo_a, wo_b)."""

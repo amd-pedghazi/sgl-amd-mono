@@ -8,9 +8,10 @@ the input norm, q_a | kv_a, the q and kv norms, the cache writes, q_b, the index
 TP reduce, the post-attention norm, the router, the routed and shared FP8 experts
 and the MoE TP reduce, adding both outputs to the hidden stream.
 
-The forward is ``DeepseekV2ForCausalLM.forward`` for a routed decode step: SGLang's
-embedding, dense layers 0 to 2, final norm and logits processor around the 75 MoE
-layers' launches. The first covered layer takes the stream layer 2 wrote and,
+The forward is ``DeepseekV2ForCausalLM.forward`` for a routed decode or MTP verify
+step (a verify step's rows are its requests' draft chains): SGLang's embedding,
+dense layers 0 to 2, final norm and logits processor around the 75 MoE layers'
+launches. The first covered layer takes the stream layer 2 wrote and,
 being a layer that reuses the previous top-k, layer 2's indices. A pad row
 (SGLang's padding slot 0, or a width's row past the step) writes no cache and
 attends no key.
@@ -28,13 +29,25 @@ import os
 
 import msgspec
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.glm53 import HF_CONFIG
@@ -62,6 +75,10 @@ SGLANG_READS = {
         "page_size",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
+        "speculative_algorithm",
+        "speculative_eagle_topk",
+        "speculative_num_steps",
+        "speculative_num_draft_tokens",
     ),
     "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/environ.py": (
@@ -109,8 +126,9 @@ SGLANG_READS = {
         "lm_head",
         "forward(prev_topk_indices)",
     ),
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "DeviceLimits",
+        "Feature",
         "MonoSpec",
         "Numerics",
         "NumericsKind",
@@ -137,6 +155,8 @@ NUMERICS = Numerics(
         "layer.streams.cosine": 0.95,
         "layer.kv.cosine": 0.995,
         "layer.index.cosine": 0.999,
+        # an indexer layer selects every key of a row's own draft chain SGLang selects
+        "layer.topk_own.max_abs": 0.0,
     },
 )
 
@@ -165,6 +185,12 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append(f"RoPE {rope_type!r}: the kernel's softmax scale is unscaled")
     if cfg.page_size not in (None, PAGE_SIZE):
         reasons.append(f"--page-size {cfg.page_size}: the DSA caches need {PAGE_SIZE}")
+    # a verify row sees the keys up to its own position: one draft chain per request
+    if cfg.speculative_algorithm is not None and (
+        cfg.speculative_eagle_topk != 1
+        or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
+    ):
+        reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
     quant = getattr(hf_config, "quantization_config", None) or {}
     if quant.get("quant_method") != "fp8" or list(
         quant.get("weight_block_size") or ()
@@ -235,7 +261,9 @@ class _Built:
     """One rank's monokernels: the runtimes per (width, kind), each covered layer's
     ops, the step's rows per width, and the forward."""
 
-    def __init__(self, lm, layers: dict, runtimes: dict, cos, sin, tp: int, device):
+    def __init__(
+        self, lm, layers: dict, runtimes: dict, cos, sin, tp: int, device, context_len
+    ):
         from sgl_amd_mono.glm53.gfx950.config import HIDDEN
         from sgl_amd_mono.glm53.gfx950.runner import Glm53Step
 
@@ -243,6 +271,7 @@ class _Built:
         self._layers, self.runtimes = layers, runtimes
         self.first, self.last = min(layers), max(layers)
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
+        self.max_position = context_len - 1
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
         self.topk_cols = torch.arange(TOPK, dtype=torch.int64, device=device)
@@ -269,7 +298,7 @@ class _Built:
         input_embeds=None,
         pp_proxy_tensors=None,
     ):
-        """``DeepseekV2ForCausalLM.forward`` for a routed decode step."""
+        """``DeepseekV2ForCausalLM.forward`` for a routed decode or verify step."""
         lm = self.lm
         if plan.key.rows > self.max_rows:
             return type(lm).forward(
@@ -370,7 +399,7 @@ class _Built:
                 plan.state["ref_topk"] = ref["topk"]
         out = L.ops[W].launch(h, L.caches, self.cos, self.sin, step)
         if checking:
-            check.compare(L, ref, out[:S], positions, forward_batch, S)
+            check.compare(L, ref, out[:S], positions, forward_batch, S, step=step)
         if L.i != self.last:
             return out
         for (w, _), rt in self.runtimes.items():
@@ -440,13 +469,18 @@ class _Built:
             valid = loc != 0
             st.slots[:S] = torch.where(valid, loc, -1)
             st.slots[S:] = -1
-            st.positions[:S] = positions[:S].to(torch.int64)
+            # verify rows past the context are lookahead the scheduler discards; the
+            # rotary table and the indexer's score rows end at the context
+            pos = positions[:S].to(torch.int64).clamp(max=self.max_position)
+            st.positions[:S] = pos
             st.positions[S:] = 0
-            seq = forward_batch.seq_lens[:S].to(torch.int32)
-            count = torch.where(valid, seq.clamp(max=TOPK), 0)
+            # a row sees keys 0 ..= its position (in TARGET_VERIFY seq_lens holds
+            # each request's prefix, not each row's keys)
+            count = torch.where(valid, (pos + 1).clamp(max=TOPK), 0)
             # indptr[0] stays 0 from its allocation
             st.indptr[1 : S + 1] = torch.cumsum(count, 0, dtype=torch.int32)
             st.indptr[S + 1 :] = st.indptr[S]
+            # the DSA backend repeats a verify request's page-table row for each row
             st.req_ids[:S] = torch.arange(S, dtype=torch.int32, device=loc.device)
             st.req_ids[S:] = 0
             md = get_attn_backend().forward_metadata
@@ -534,7 +568,9 @@ def _build(model, hf_config, ctx) -> _Built:
     for w in widths[start:] + widths[:start]:
         for kind in kinds:
             runtimes[w, kind].precompile()
-    return _Built(model, layers, runtimes, cos, sin, tp, device)
+    return _Built(
+        model, layers, runtimes, cos, sin, tp, device, context_len=context_len
+    )
 
 
 SPEC = MonoSpec(
@@ -542,13 +578,15 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(widths=ROWS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
     },
-    features=frozenset(),
+    features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),
         server_args={
             "kv_cache_dtype": frozenset({"auto", "bfloat16"}),
             "moe_runner_backend": frozenset({"auto", "aiter"}),
+            # MTP: the NextN draft's verify steps (NEXTN resolves to EAGLE)
+            "speculative_algorithm": frozenset({None, "EAGLE"}),
             # HiSparse maps the logical KV slots to device rows; the kernels write raw slots
             "enable_hisparse": frozenset({False}),
             # the launches record no expert distribution (SGLang's forward sets it per layer)
@@ -565,6 +603,6 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
 )

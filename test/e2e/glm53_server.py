@@ -1,5 +1,5 @@
 """The GLM-5.3 servers that the monokernel serving test launches: MI35x, TP8,
-decode steps (no speculative decoding)."""
+decode steps, and with ``MTP`` the NextN draft's verify steps."""
 
 import os
 
@@ -25,4 +25,16 @@ ARGS = [
     "tilelang",
     "--reasoning-parser",
     "glm45",
+]
+# SGLang's MTP default for GLM-5.3: one draft chain of 3 tokens, 4 verify rows a
+# request
+MTP = [
+    "--speculative-algorithm",
+    "EAGLE",
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
 ]

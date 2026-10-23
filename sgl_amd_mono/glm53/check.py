@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """SGLANG_AMD_MONO_CHECK=1 (eager only): each covered layer also runs SGLang's
 layer on its input, on the caches as they were, and checks the kernel's outputs
-against it: the hidden stream it writes, and the cache rows the layer writes, each
-against its ``spec.NUMERICS`` bound. Every check is logged; a miss is logged as a
-violation."""
+against it: the hidden stream it writes, the cache rows the layer writes, and on
+an indexer layer the top-k it selects, each against its ``spec.NUMERICS`` bound.
+Every check is logged; a miss is logged as a violation.
+
+On an indexer layer the index keys the step writes stay in the cache as SGLang
+writes them, with their scales set to POISON_SCALE. A launch must score those keys
+from its rows' pairs; one that reads the cache drops each of them that SGLang
+selects with a positive score from its top-k (``layer.topk_own``)."""
 
 from __future__ import annotations
 
@@ -32,6 +37,9 @@ SGLANG_READS = {
 
 PAGE_TOKENS = 64  # tokens an index-cache page covers
 INDEX_VALUE_BYTES = PAGE_TOKENS * 128  # an index page's FP8 values; f32 scales follow
+# the kernel scales a key's head-weighted ReLU sum: a positive sum then scores below
+# any top-k threshold; finite, so a zero sum scores 0, not NaN
+POISON_SCALE = -1e30
 SHARED_EXPERT = 256  # SGLang's id for the fused shared expert
 TOP_K, ROUTE_SCALE = 8, 2.5
 
@@ -64,6 +72,32 @@ def _outputs(name: str, a: torch.Tensor, b: torch.Tensor) -> dict[str, dict]:
     # a key whose amax sits at a power of two may take the other scale and values
     (ka, sa), (kb, sb) = _index_keys(a), _index_keys(b)
     return {"index": _metrics(ka, kb), "index_scale": _metrics(sa, sb)}
+
+
+def poison_new_index_scales(pages: torch.Tensor, slots: torch.Tensor) -> None:
+    """Set the cached scales of the index keys at ``slots`` (this step's, 0 = pad)
+    to POISON_SCALE in the uint8 index pages."""
+    slots = slots[slots != 0].long()
+    scales = pages.view(pages.shape[0], -1)[:, INDEX_VALUE_BYTES:].view(torch.float32)
+    scales[slots // PAGE_TOKENS, slots % PAGE_TOKENS] = POISON_SCALE
+
+
+def _topk_outputs(ref_topk: torch.Tensor, step, slots: torch.Tensor, S: int) -> dict:
+    """Per row, SGLang's selected KV slots against the kernel's (``step.topk`` at
+    the row's ``indptr``): the largest share of SGLang's a row misses, and the most
+    of this step's own slots (a verify row's earlier drafts and itself) one misses."""
+    bounds = step.indptr[: S + 1].tolist()
+    picked = step.topk.tolist()
+    own = set(slots[slots != 0].tolist())
+    rel, own_missed = 0.0, 0
+    for s, row in enumerate(ref_topk[:S].tolist()):
+        want = {k for k in row if k >= 0}
+        if not want:
+            continue
+        missed = want - set(picked[bounds[s] : bounds[s + 1]])
+        rel = max(rel, len(missed) / len(want))
+        own_missed = max(own_missed, len(missed & own))
+    return {"topk": {"rel": rel}, "topk_own": {"max_abs": float(own_missed)}}
 
 
 def _regions(L, forward_batch, S: int) -> dict:
@@ -113,7 +147,8 @@ def _f32_routing(mlp):
 
 def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
     """SGLang's layer on ``h_in`` [S, HIDDEN] (a copy), routed in f32: its output
-    stream, its top-k and the cache rows it writes; the caches are restored after."""
+    stream, its top-k and the cache rows it writes. The KV cache is restored after;
+    the index keys keep SGLang's values with POISON_SCALE scales."""
     from sglang.srt.layers.layer_boundary.residual.batch import (
         fold,
         set_written,
@@ -122,7 +157,8 @@ def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
     from sglang.srt.utils.common import BumpAllocator
 
     regions = _regions(L, forward_batch, S)
-    saved = {name: t[idx].clone() for name, (t, idx) in regions.items()}
+    kv, kv_slots = regions["kv"]
+    saved = kv[kv_slots].clone()
     hidden = set_written(h_in, forward_batch)
     zero = BumpAllocator(buffer_size=4, dtype=torch.float32, device=h_in.device)
     hooks = _f32_routing(L.module.mlp)
@@ -145,12 +181,14 @@ def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
     }
     for name, (t, idx) in regions.items():
         ref[name] = t[idx].clone()
-        t[idx] = saved[name]
+    kv[kv_slots] = saved
+    if "index" in regions:
+        poison_new_index_scales(regions["index"][0], forward_batch.out_cache_loc[:S])
     return ref
 
 
 def compare(
-    L, ref: dict, streams: torch.Tensor, positions, forward_batch, S: int
+    L, ref: dict, streams: torch.Tensor, positions, forward_batch, S: int, *, step
 ) -> None:
     from sglang.srt.runtime_context import get_parallel
 
@@ -161,6 +199,10 @@ def compare(
     outputs = _outputs("streams", streams, ref["streams"])
     for name, (t, idx) in _regions(L, forward_batch, S).items():
         outputs.update(_outputs(name, t[idx], ref[name]))
+    # SGLang's layer returns no top-k when no later layer reuses it
+    if L.w.index is not None and ref["topk"] is not None:
+        slots = forward_batch.out_cache_loc[:S]
+        outputs.update(_topk_outputs(ref["topk"], step, slots, S))
     values = {
         f"layer.{out}.{metric}": v
         for out, ms in outputs.items()

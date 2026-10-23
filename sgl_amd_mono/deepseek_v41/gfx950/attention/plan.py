@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K1 geometry and scratch layout."""
+"""K1 and K2 attention geometry and scratch layout."""
 
 import msgspec
 
@@ -124,15 +124,17 @@ def front_scratch(s: int, d: Dims) -> dict:
             ("qx8", s * Q_RANK),  # e4m3 words
             ("qx8s", s * Q_RANK // 32 * 4),  # an i32 code a group
             ("qrdy", s * PAIR),
+            # an index source's ``index_query``: bf16 IQ, a flag a (token tile, 16-column task)
+            ("iq", s * 4096 * 2),
+            ("iqrdy", cdiv(s, 16) * 256 * PAIR),
         ]
     )
 
 
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
     """Return K2's scratch regions past ``start`` -> (byte offset, bytes)."""
-    ck = (
-        64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
-    )  # back.chunk_keys
+    # must match back.chunk_keys
+    ck = 64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
     nchunk = cdiv(KEYS, ck)
     return byte_layout(
         [
@@ -143,7 +145,7 @@ def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
             ("crdy", s * d.heads // 8 * PAIR),
             ("x8b", s * d.o_rows),
             ("x8bs", s * d.o_rows // 32 * 4),
-            ("ardy", d.woa_tasks * PAIR),
+            ("ardy", d.woa_tasks * cdiv(s, ROWS) * PAIR),  # a flag a wo_a unit
         ],
         start=start,
     )

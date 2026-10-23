@@ -1,12 +1,13 @@
-"""MiniMax-M3 with --monokernel-backend amd on MI35x, TP4, across the switch points:
-verify steps with EAGLE3 (4 requests of 4 rows at the largest width) and decode
-steps without it (16 rows, with HiCache). Each server's startup line shows its
-tested batches run the monokernels; batches step past the largest width and back
-(a short GSM8K run, for gross failures), and the tokens of covered steps are scored
-again by the normal prefill path (KL consistency). A passkey deep in a long prompt
-checks the block selection. In check mode every sparse layer's launch is held to
-the spec's bounds against SGLang's modules on the same input. A fault on one rank
-stops the server before any token of the failed step is sent."""
+"""MiniMax-M3 with --monokernel-backend amd on MI35x, TP4, across the switch points.
+
+Verify steps with EAGLE3 (4 requests of 4 rows at the largest width) and decode steps
+without it (16 rows, with HiCache): each server's startup line shows its tested batches
+run the monokernels, a short GSM8K run steps past the largest width and back (gross
+failures), and the normal prefill path scores the covered steps' tokens again (KL
+consistency). A passkey deep in a long prompt checks the block selection. Check mode
+holds every sparse layer's launch to the spec's bounds against SGLang's modules on the
+same input, and a fault on one rank stops the server before any token of the failed
+step is sent."""
 
 import os
 import re
@@ -36,17 +37,13 @@ from sgl_amd_mono import BACKEND
 from sgl_amd_mono.minimax_m3.spec import NUMERICS
 
 LAUNCH_TIMEOUT = 3600
-# A smoke check across the switch points (8-shot, 200 questions): 0.905 / 0.920 on
-# the normal path, 0.905 / 0.905 with the monokernels (verify / decode server). The
-# accuracy gate is the full chat GSM8K at 4 requests (every verify step covered):
-# 96.36% with the monokernels, 96.69% on the normal path, 3 runs each.
+# a smoke check, 8-shot x 200: normal 0.905 / 0.920, monokernels 0.905 / 0.905 (verify / decode)
+# the accuracy gate is full chat GSM8K at 4 requests: monokernels 96.36%, normal 96.69%, 3 runs each
 GSM8K_BOUND = 0.87
-# Decode against prefill on LongBench-v2 prompts, mean KL over 3 runs a server:
-# 0.056 to 0.087 on the normal path, 0.058 to 0.099 with the monokernels
+# LongBench-v2 mean KL, 3 runs a server: normal 0.056 to 0.087, monokernels 0.058 to 0.099
 KL_BOUND = 0.12
 PASSKEY = "4861372950"
-# Check mode: the rows whose residual routes to other experts than SGLang's, 5.8%
-# of them measured (8-9% in layers 20-29)
+# check mode: rows routed to other experts than SGLang's, 5.8% measured (8-9% in layers 20-29)
 ROUTED_ELSEWHERE_BOUND = 0.1
 PASSKEY_PROMPT_TOKENS = 60000
 
@@ -93,8 +90,7 @@ class _Serving:
             log.close()
 
     def test_the_tested_batches_run_the_monokernels(self):
-        # routing is fixed at startup; without this, the other tests could pass on
-        # the normal path alone
+        # routing is fixed at startup; else the other tests could pass on the normal path alone
         self.assertIn(self.RUNS, _logs(self.logs))
 
     def test_gsm8k_past_the_largest_width(self):
@@ -112,9 +108,7 @@ class _Serving:
         self.assertGreater(metrics["accuracy"], GSM8K_BOUND)
 
     def test_covered_steps_match_prefill(self):
-        # one batch within the largest covered width: every decode or verify step
-        # runs the monokernels, and the prefill that scores the tokens again is the
-        # normal path
+        # within the largest width every step runs the monokernels; the rescoring prefill does not
         assert_logprobs_match(
             DEFAULT_URL_FOR_TEST,
             {MODEL: {"kl_div": KL_BOUND}},
@@ -135,8 +129,7 @@ class TestMonokernelVerify(_Serving, CustomTestCase):
     )
 
     def test_passkey_deep_in_a_long_prompt(self):
-        # a fact a fifth of the way into a long prompt: the indexer must select its
-        # block among the context's for every verify step that answers
+        # a fact a fifth into a long prompt: every answering step must select its block
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         tok = get_tokenizer(MODEL, trust_remote_code=True)
@@ -178,8 +171,7 @@ class TestMonokernelDecode(_Serving, CustomTestCase):
 
 class TestMonokernelCheck(CustomTestCase):
     def test_every_launch_is_within_the_bounds(self):
-        # eager verify steps, each sparse layer's launch against SGLang's modules
-        # on a copy of its input (SGLANG_AMD_MONO_CHECK)
+        # check mode: eager steps, every launch against SGLang's modules on a copy of its input
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
@@ -234,9 +226,8 @@ class TestMonokernelCheck(CustomTestCase):
 
 class TestMonokernelFault(CustomTestCase):
     def test_a_stalled_rank_stops_the_server_without_tokens(self):
-        # past startup (the epoch counts steps: 200 of them), rank 1 stalls at its
-        # first wait; at the deadline (half the watchdog, 60 s at most) it stops, and
-        # its peers stop on its flag. The watchdog leaves startup's JIT builds room.
+        # rank 1 stalls at its first wait after 200 steps; at the deadline (watchdog / 2) all stop
+        # --watchdog-timeout 120 still leaves startup's JIT builds room
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
@@ -271,9 +262,7 @@ class TestMonokernelFault(CustomTestCase):
                 err.seek(0)
                 out.seek(0)
                 log = err.read() + out.read()
-                # a launch never runs on after a failed wait: it stops with a store
-                # to the null page, so the only faults are at address 0x0 (ROCm
-                # prints "faulting addr: 0x0" or "on address (nil)")
+                # a failed wait stops the launch with a null-page store: faults only at 0x0 / (nil)
                 faults = re.findall(
                     r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))", log
                 )

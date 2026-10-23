@@ -1,6 +1,7 @@
-"""Symmetric peer memory for in-kernel TP all-reduces, through the HIP runtime
-this process loaded (``create_shared_buffer`` supports only CUDA). Construction is
-collective, and all ranks refuse together.
+"""Symmetric peer memory for in-kernel TP collectives, through this process's HIP runtime.
+
+``create_shared_buffer`` supports only CUDA. Construction is collective, and all
+ranks refuse together.
 
 Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 97359d6 (MIT License,
 Copyright (C) 2026, Advanced Micro Devices, Inc.): atom/mono/runtime/peer_memory.py.
@@ -17,8 +18,7 @@ import torch.distributed as dist
 _IPC_HANDLE_BYTES = 64
 _IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
 _DEVICE_MALLOC_UNCACHED = 0x3
-# A peer maps an IPC handle in 2 MiB granules: bytes past the last whole granule of
-# the exporter's allocation fault on the peer, so allocate whole granules.
+# a peer maps an IPC handle in 2 MiB granules, so a partial last granule faults there
 _GRANULE = 2 << 20
 
 

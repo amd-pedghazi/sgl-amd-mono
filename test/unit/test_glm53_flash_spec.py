@@ -6,7 +6,11 @@ declared requirements, the same way for every spec."""
 from types import SimpleNamespace
 
 import torch
-from sglang.srt.monokernels import spec as registry
+
+try:
+    from sglang.kernels.plugin_kernels.amd import spec as registry
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
 from sgl_amd_mono.glm53_flash import HF_CONFIG, LINEAR_ATTN_CONFIG
@@ -75,6 +79,24 @@ def test_a_step_runs_at_the_next_width_and_tp2_takes_four_rows():
     assert lm.ran == [("ids", "positions", "batch", None, None)]
     # the first covered layer's identity mix leaves the written streams unchanged
     assert torch.equal(built.eye_comb[1], torch.eye(4)) and not built.zero_x.any()
+
+
+def test_the_spec_needs_aiters_grouped_topk(monkeypatch):
+    # the kernel's router ties follow AITER's grouped top-k; SGLang's JIT grouped
+    # top-k (a Triton gate) keeps the lower expert id, so the spec requires it off.
+    # SGLang refuses a spec whose required env value differs from envs' value.
+    from sglang.srt.environ import envs
+
+    def unmet():
+        req = flash.SPEC.requires.env
+        return [name for name, want in req.items() if getattr(envs, name).get() != want]
+
+    name = "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK"
+    assert flash.SPEC.requires.env[name] is False
+    monkeypatch.delenv(name, raising=False)
+    assert unmet() == []
+    monkeypatch.setenv(name, "1")
+    assert unmet() == [name]
 
 
 def _cfg(**kw):

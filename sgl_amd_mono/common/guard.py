@@ -1,23 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Deadlines, sticky error words and the stop of a failed launch (RFC #43949).
 
-Each wait on another workgroup or rank has a deadline below the server's
-watchdog timeout. On a timeout the wait sets a sticky error word on its GPU,
-writes an error flag to every peer, fences, and stops the launch (a store to
-the null page: a GPU fault at address 0x0), and with it the process. A wait
-that sees a failure (its own GPU's words or a peer's flag) stops too. A launch
-never runs on after a failed wait: its data-dependent addresses would come from
-words that never arrived. A rank finishes a step only when each of its waits got
-that step's data, so its tokens are correct; nothing is checked on the host.
-
-The deadline comes from ``--watchdog-timeout`` (half of it, at most 60 s), and
-one under 5 s is refused, so that a normal delay on one rank is not a failure
-(SGLang's ``sglang.srt.monokernels.guards``). A satisfied wait costs nothing
-more, and so does a pending one that the data reaches within ``CHECK_POLLS``
-polls; a longer one checks the failure flags every ``CHECK_POLLS`` polls and its
-deadline on the 100 MHz ``s_memrealtime`` clock from the first of those checks.
-The guard loads nothing at launch entry: the deadline and the peers' addresses
-are read only on those checks and on a failure.
+Each wait on another workgroup or rank has a deadline below the server's watchdog:
+half of ``--watchdog-timeout``, at most 60 s, and SGLang refuses one under 5 s, so a
+normal delay on one rank is not a failure. On a timeout the wait sets a sticky error
+word, flags every peer, fences and stops the launch (a store to the null page), and
+with it the process; a wait that sees a failure (its GPU's words or a peer's flag)
+stops too. A launch never runs on after a failed wait, since its data-dependent
+addresses would come from words that never arrived, so a finished step's tokens are
+correct with nothing checked on the host. A pending wait checks the flags every
+``CHECK_POLLS`` polls and its deadline on the 100 MHz ``s_memrealtime`` clock from the
+first check; the guard reads the deadline and the peers' addresses only on those
+checks and on a failure.
 
 The guard block lives in the launch's epoch buffer (int32 words):
 
@@ -31,11 +25,8 @@ word  meaning
 5     ``fault``: set by the test fault injection (``SGLANG_AMD_MONO_FAULT_INJECT``)
 ====  ======================================================================
 
-A peer's error flags are ``FLAG_WORDS`` words at ``flags_offset`` of each
-rank's peer buffer: rank r writes word r of every rank's flags, its own too.
-
-The guard is set for the duration of a kernel's trace (``scope``); the waits
-pick it up there, so a kernel only builds its guard once at the top.
+A rank's error flags are ``FLAG_WORDS`` words at ``flags_offset`` of each rank's
+peer buffer: rank r writes word r of every rank's flags, its own too.
 """
 
 import contextlib
@@ -76,9 +67,10 @@ def deadline_ticks(seconds: float) -> int:
 
 
 def fault_injection(rank: int) -> Optional[tuple[int, int]]:
-    """(site, after): the wait this rank stalls at once ``after`` launches have run,
-    from ``SGLANG_AMD_MONO_FAULT_INJECT`` (``rank:site[:after]``), or None. A test
-    hook: the stalled wait times out."""
+    """This rank's test fault injection from ``SGLANG_AMD_MONO_FAULT_INJECT``
+    (``rank:site[:after]``): (site, after), or None.
+
+    Once ``after`` launches have run, the wait at ``site`` stalls until it times out."""
     spec = os.environ.get("SGLANG_AMD_MONO_FAULT_INJECT", "")
     if not spec:
         return None
@@ -87,10 +79,11 @@ def fault_injection(rank: int) -> Optional[tuple[int, int]]:
 
 
 def stop_launch():
-    """Stop the launch: a volatile store to the null page faults (address 0x0, so a
-    deliberate stop is told apart from a real fault), and the runtime tears the
-    queue down. Unlike ``llvm.trap`` it asks nothing of the kernel's ABI, so a
-    launch that never fails pays nothing for it."""
+    """Stop the launch with a volatile store to the null page.
+
+    The fault at address 0x0 tells a deliberate stop apart from a real one, and the
+    runtime tears the queue down. Unlike ``llvm.trap`` it asks nothing of the kernel's
+    ABI, so a launch that never fails pays nothing for it."""
     fx.generic_store(global_ptr(0), fx.Int32(1), volatile=True)
 
 
@@ -228,7 +221,8 @@ _CURRENT: list[Guard] = []
 
 @contextlib.contextmanager
 def scope(guard: Optional[Guard]):
-    """Make ``guard`` the one the waits traced inside this block take."""
+    """Make ``guard`` the one the waits traced inside this block take, so a kernel
+    builds its guard once at the top."""
     _CURRENT.append(guard)
     try:
         yield guard

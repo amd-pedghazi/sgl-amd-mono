@@ -79,8 +79,7 @@ def test_verify_padding_uses_slots_not_prefix_length():
     blocks, lengths = prepare_token_rows(
         *args, query_len=4, is_verify=True, max_context_len=512
     )
-    # A live first verification has a zero accepted prefix too. Only the
-    # reserved dummy cache slots distinguish it from the padded request.
+    # a live first verify has a zero prefix too: only the dummy slots mark the padded request
     assert lengths.tolist() == [1, 2, 3, 4, 0, 0, 0, 0]
     assert blocks.tolist() == [[6, 2, 8, 5]] * 4 + [[0, 0, 0, 0]] * 4
 

@@ -30,9 +30,7 @@ SPLIT_KEYS = 256  # keys per split task (one paged-attention context partition)
 N_SPLIT = MAX_SPARSE_KEYS // SPLIT_KEYS
 O_K = H * HEAD_DIM
 O_ROWS = 32  # hidden rows per o_proj / attention-reduce task
-# from this many tokens the attention all-reduce is a reduce-scatter to the row
-# group's owner rank (t % npes) plus an all-gather of the sums: half the bytes over
-# each link for one more hop (smaller batches are latency-bound: one hop wins)
+# from here both all-reduces are reduce-scatter + all-gather: half the bytes a link, one more hop
 AG_RS_FROM = 12
 N_O = HIDDEN // O_ROWS
 PAGES_PER_BLOCK = SPARSE_BLOCK // PAGE16
@@ -43,9 +41,7 @@ SH_ROWS = 8  # mid rows per shared-expert up / gate task (a half task)
 SH_TASKS = INTER // SH_ROWS
 DN_ROWS = 32
 N_DN = HIDDEN // DN_ROWS
-# The router logits are written SCORE_COPIES times and CTA b polls copy
-# b % SCORE_COPIES: hundreds of expert CTAs spinning on one 1 KB region serialize
-# on its cache lines.
+# CTA b polls router-logit copy b % SCORE_COPIES: hundreds of CTAs on one 1 KB region serialize
 SCORE_COPIES = 8
 
 
@@ -59,8 +55,7 @@ def _layout(items, align=256):
     return out
 
 
-# a context past THREADS blocks, one-head build: each split task's TOPK_BLOCKS
-# best (key, block) (indexer context parallelism: the peers' sel_cp)
+# each split task's TOPK_BLOCKS best (key, block) of a context past THREADS blocks (CP: ``sel_cp``)
 SEL_LONG_PAIRS = N_SPLIT * TOPK_BLOCKS * 2
 
 # every region holds MAX_TOKENS rows (token k at k * the one-token size)
@@ -77,8 +72,8 @@ SCRATCH = _layout(
         ("a", HIDDEN // 2 * MAX_TOKENS),
         ("xn8", HIDDEN // 4 * MAX_TOKENS),  # MXFP8 xn, 4 fp8 per word
         ("xsc", HIDDEN // 32 * MAX_TOKENS),  # and its per-1x32 E8M0 scales
-        # copy c, token k at pairs [(c * MAX_TOKENS + k) * N_ROUTED, ..)
-        # per expert (routing key, sigmoid) pairs, see route_key
+        # copy c, token k at pairs [2 (c * MAX_TOKENS + k) N_ROUTED, ..): expert e's
+        # (routing key, sigmoid) at 2 e, 2 e + 1, see route_key
         ("scores", 2 * N_ROUTED * MAX_TOKENS * SCORE_COPIES),
         ("mid", MOE_SLOTS * INTER * MAX_TOKENS),
         # token k's split task p's candidates: rank r at pairs 2 ((k N_SPLIT + p)
@@ -103,8 +98,7 @@ def sym_layout(npes: int):
     """Per-rank symmetric buffer: attn / ffn partial regions, [src rank][token][HIDDEN],
     and the peers' index-selection candidates (``sel_cp``)."""
     rows = npes * MAX_TOKENS * HIDDEN // 2
-    # a_ag / ffn_ag: the finished attention / FFN all-reduce rows, each written by
-    # its owner rank (the reduce-scatter + all-gather form, S >= AG_RS_FROM)
+    # a_ag / ffn_ag: S >= AG_RS_FROM's finished all-reduce rows, each written by its owner rank
     ag = MAX_TOKENS * HIDDEN // 2
     return _layout(
         [
@@ -154,11 +148,13 @@ def ug_tasks_of(cta: int, tokens: int) -> int:
 
 
 def _shared_base(tokens: int, router: int) -> int:
-    """First of the SH_TASKS consecutive CTAs that run the shared expert's up /
-    gate before the routing lands. Ranked by the most routed up / gate tasks a
-    window CTA carries (they queue behind it); then, only if that is the most any
-    CTA carries, by its router CTAs (they start it late and would delay the last
-    routed tasks); then by its down CTAs; then by its router CTAs anyway."""
+    """First of the SH_TASKS consecutive CTAs that run the shared expert's up / gate
+    before the routing lands.
+
+    Ranked by the most routed up / gate tasks a window CTA carries (they queue behind
+    it); then, only if that is the most any CTA carries, by its router CTAs (they start
+    it late and would delay the last routed tasks); then by its down CTAs; then by its
+    router CTAs anyway."""
     n_router = N_ROUTER * tokens
     n_split = N_SPLIT * tokens
     most = max(ug_tasks_of(c, tokens) for c in range(BLOCKS))
@@ -192,13 +188,10 @@ def wide_moe(tokens: int) -> bool:
     return tokens >= WIDE_FROM
 
 
-# LDS rows of a token's MXFP8 xn and of its E8M0 scales, padded by 16 B: at the
-# natural 1536 / 192-word rows the 16 tokens a MFMA B operand gathers sit in one
-# bank group (16-way conflicts)
+# LDS rows padded by 16 B: at 1536 / 192 words the 16 rows an MFMA B operand reads conflict 16-way
 XN8_ROW = HIDDEN // 4 + 4
 XSC_ROW = HIDDEN // 32 + 4
-# and the down stage's MXFP8 mid rows / their scales (16 lanes, 16 rows): 196 and
-# 28 words put the rows' 16 B reads, and 4 B scale reads, in distinct banks
+# down-stage mid rows / scales: 196 / 28 words put 16 rows' 16 B / 4 B reads in distinct banks
 MID_ROW = INTER // 4 + 4
 MIDSC_ROW = INTER // 32 + 4
 # and the o stage's FP8 attention rows (512 words: the same 16-way conflict)

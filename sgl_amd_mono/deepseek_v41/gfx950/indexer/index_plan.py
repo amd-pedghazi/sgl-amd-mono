@@ -5,12 +5,9 @@
 # sgl-project/sglang#43984 at 134919476c
 """The FP4 scorer's tasks of a step, defined once.
 
-Each function takes a token's ``bound`` -- how many columns its scorer may read:
-the compressed length of its ratio, or the candidate table's context on a REINDEX
-layer -- and is called both by the kernel (on traced Int32) and by the CPU test
-(on Python ints), so the test checks what the kernel runs. Only non-negative
-operands reach ``//`` and ``%``, where Python's floor and the device's truncation
-agree.
+The kernel calls these on traced Int32 and the CPU test on Python ints, so the test checks what
+the kernel runs; only non-negative operands reach ``//`` and ``%``, where Python's floor and the
+device's truncation agree. A token's ``bound`` is the columns its scorer may read.
 """
 
 import numpy as np
@@ -28,26 +25,24 @@ DIM = 128  # an index head's dims (``index_head_dim``)
 
 
 def scored(bound):
-    """Does the scorer run for a token? Not while its top-k is every column it
-    sees (bound <= TOPK: SGLang's top-k then takes them all, reading no logits)."""
+    """Whether the scorer runs for a token.
+
+    At ``bound <= TOPK`` SGLang's top-k takes every column and reads no logits."""
     return bound > TOPK
 
 
 def score_chunks(bound):
-    """The chunks the scorer scores for a token: chunk ch covers columns
-    [CHUNK ch, CHUNK (ch + 1))."""
+    """A token's scored chunks; chunk ch covers columns [CHUNK ch, CHUNK (ch + 1))."""
     return sel(scored(bound), cdiv(bound, CHUNK), 0)
 
 
 def fill_walk_plan(*, bounds, owners, plan):
-    """The FP4 plane's FULL-layer score tasks of a step, on the host: ``plan``
-    [ctas, 4] int32 gets a (lead, span, ch0, ch1) a CTA -- chunks [ch0, ch1)
-    of the ``span`` tokens from ``lead``, a piece: at most WALK_ROWS adjacent
-    tokens of one owner (one page table), scored off each key load -- and
-    zeros past the last task. ``bounds`` and ``owners`` are the step's rows
-    (int numpy). Every piece gets ceil(need / width) tasks sharing its chunks
-    evenly, at the smallest width that fits them all in ``ctas``: a width one
-    chunk too wide left a wave per CTA a step behind the rest."""
+    """The FP4 plane's FULL-layer score tasks of a step, on the host.
+
+    ``plan`` [ctas, 4] gets (lead, span, ch0, ch1) a CTA -- chunks [ch0, ch1) of a piece, the
+    ``span`` tokens from ``lead``: at most WALK_ROWS adjacent tokens of one owner, scored off each
+    key load -- and zeros past the last task. A piece's chunks are split evenly at the smallest
+    width that fits ``ctas``, as one chunk wider leaves a wave per CTA a step behind the rest."""
     n, ctas = bounds.shape[0], plan.shape[0]
     plan.fill(0)
     t = np.arange(n)
@@ -62,9 +57,7 @@ def fill_walk_plan(*, bounds, owners, plan):
     if not need.size:
         return
     assert need.size < ctas, (need.size, ctas)
-    # the width search's range: ceil(total / ctas), the least that could fit,
-    # to ceil(total / (ctas - pieces)), which does (a piece's ceil adds under
-    # one task); feasibility is monotone, so the first width that fits
+    # feasibility is monotone in width, and ceil(total / (ctas - pieces)) fits: each ceil adds < 1
     total = int(need.sum())
     lo = max(cdiv(total, ctas), 1)
     widths = np.arange(lo, max(cdiv(total, ctas - need.size), lo) + 1)[:, None]
@@ -84,10 +77,9 @@ REINDEX_CHUNKS = TOPK_BLOCKS * BLOCK_ROWS // CHUNK
 
 
 def reindex_split(tokens, ctas, least):
-    """FP4 plane, a REINDEX layer: tasks a token (each its own piece on its own
-    candidate table), REINDEX_CHUNKS shared over them -- fixed by the step's
-    width, so a CTA finds its task from its index alone. At least ``least``
-    chunks a task."""
+    """A REINDEX layer's tasks a token, at least ``least`` chunks each.
+
+    Fixed by the step's width alone, so a CTA finds its task from its index with no plan."""
     return max(1, min(ctas // tokens, REINDEX_CHUNKS // least))
 
 

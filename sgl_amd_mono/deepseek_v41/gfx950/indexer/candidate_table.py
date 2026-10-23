@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # ``_reindex_table_kernel`` from sgl-project/sglang#43984 at 134919476c
 # (kernels/ops/mono/gfx950/deepseek_v41/indexer/candidate_table.py)
-"""A REINDEX layer's compact columns: the key table K2i scores them through
-(``reindex_table``), and their selection mapped back to the layer's positions and
-pool slots (``map_compact_selection``). Outputs go to caller-owned buffers, so a
-replayed graph reads the captured addresses."""
+"""A REINDEX layer's compact columns: K2i's key table for them, and their selection mapped back.
+
+Outputs go to caller-owned buffers, so a replayed graph reads the captured addresses."""
 
 import torch
 import triton
@@ -31,11 +30,10 @@ def _reindex_table_kernel(
     ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """SGLang's candidate blocks (no order, -1 after the kept ones) for scoring: the
-    newest block (whose rows past ``visible`` are not keys yet) moved to the last
-    kept slot, so ``context`` -- the full blocks, then the newest one's visible
-    rows -- stops the scorer short of them; ``ids_out`` is that order (the
-    compact selection's map back to positions), ``table`` its virtual pages."""
+    """SGLang's candidate blocks (unordered, -1 after the kept ones) with the newest moved last.
+
+    The newest block's rows past ``visible`` are not keys yet, so with it last ``context`` (the
+    full blocks, then its visible rows) stops the scorer short of them."""
     token = tl.program_id(0)
     batch = tl.load(batch_ids + token)
     slots = tl.arange(0, BLOCK)
@@ -76,10 +74,10 @@ def reindex_table(
     table: torch.Tensor,
     context: torch.Tensor,
 ) -> None:
-    """``ids`` [rows, TOPK_BLOCKS] (SGLang's ``CandidateBlocks.ids``) -> ``ids_out``
-    (the newest block last), ``table`` (their virtual 8-row pages) and ``context``
-    [rows] (the compact columns a row's scorer reads); ``owners[t]`` is row t's
-    page-table row."""
+    """SGLang's ``CandidateBlocks.ids`` -> ``ids_out`` (newest block last), ``table``, ``context``.
+
+    ``table`` holds their virtual 8-row pages, ``context`` [rows] the compact columns each row's
+    scorer reads; ``owners[t]`` is row t's page-table row."""
     rows, topk_blocks = ids.shape
     assert ids.stride(1) == 1 and ids_out.stride(0) == table.stride(0) == ids.stride(0)
     _reindex_table_kernel[(rows,)](
@@ -113,10 +111,7 @@ def _map_compact_kernel(
     BLOCK_ROWS: tl.constexpr,
     PAGE_ROWS: tl.constexpr,
 ):
-    """One program a row: its selected compact column c is position
-    ids[c // BLOCK_ROWS] * BLOCK_ROWS + c % BLOCK_ROWS, in pool slot
-    page_table[row, position // PAGE_ROWS] * PAGE_ROWS + position % PAGE_ROWS;
-    -1 stays -1."""
+    """One program a row: each selected compact column -> its position and pool slot; -1 stays."""
     row = tl.program_id(0)
     j = tl.arange(0, TOPK)
     c = tl.load(compact_pos + row * TOPK + j)
@@ -142,10 +137,11 @@ def map_compact_selection(
     raw_out: torch.Tensor,
     page_out: torch.Tensor,
 ) -> None:
-    """A REINDEX layer's top-k of its compact columns (``compact_pos`` [rows,
-    TOPK], -1 padded after the valid ones) -> SGLang's ``sparse_raw_indices``
-    (``raw_out``) and ``sparse_page_indices`` (``page_out``) of its rows, through
-    ``reindex_table``'s ``ids_out`` (``ids``)."""
+    """A REINDEX layer's top-k of its compact columns -> SGLang's raw and page indices.
+
+    ``compact_pos`` is -1 padded after the valid ones, ``ids`` is ``reindex_table``'s
+    ``ids_out``, and ``raw_out`` / ``page_out`` are ``sparse_raw_indices`` /
+    ``sparse_page_indices``."""
     rows = compact_pos.shape[0]
     assert compact_pos.stride(0) == ip.TOPK and raw_out.stride(0) == page_out.stride(0)
     _map_compact_kernel[(rows,)](

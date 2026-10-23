@@ -29,7 +29,7 @@ def _k0s(part, lane, wave):
 
 
 def router_weight_loads(w, task, part, lane, wave, w_cm=0):
-    """Issue ``router_tile``'s weight loads (``w_cm``: their cache policy)."""
+    """Issue a router tile's weight loads (``w_cm``: their cache policy)."""
     row = task * ROWS + lane % 16
     return [
         fx.Vector(
@@ -46,7 +46,7 @@ def router_weight_loads(w, task, part, lane, wave, w_cm=0):
 
 
 def router_x_loads(x, part, s, lane, wave, x_cm=0, t0=0):
-    """Load ``router_tile``'s x operands for s tokens from ``t0`` (``x_cm``: their cache policy)."""
+    """Load a router tile's x operands for s tokens from ``t0`` (``x_cm``: their cache policy)."""
     tok = fx.min(lane % 16, s - 1)
     if const_expr(not isinstance(t0, int) or t0 != 0):
         tok = tok + t0
@@ -65,7 +65,7 @@ def router_x_loads(x, part, s, lane, wave, x_cm=0, t0=0):
 
 
 def router_tile_mfma(wvs, xvs, lane, wave, red):
-    """``router_tile``'s MFMAs, K steps in order -> ``red[wave][lane]``."""
+    """Run a router tile's MFMAs, K steps in order -> ``red[wave][lane]``."""
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(len(wvs)):
         acc = mfma_bf16(wvs[i].bitcast(fx.BFloat16), xvs[i].bitcast(fx.BFloat16), acc)

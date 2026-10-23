@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4.1-Flash's DSpark draft on gfx950: its spec and forward (RFC #43949).
 
-SGLang attaches the draft model as it does the target: a routed draft step (a
-block of rows a request, run as a TARGET_VERIFY batch) runs ``_Draft.forward``,
-which takes and returns what ``DeepseekV4ForCausalLMDSpark.forward`` does. Each
-stage is the target's K1 and K2 on the draft's route (128 experts, top-3, a FP4
-group an ug task) and window (the 128-token window plus the block's keys), then
-SGLang's ``hc_post``; the head's combine reads the last stage's pre, as SGLang's
-forward does. The stages' seams follow the fused mHC boundary's arithmetic where
-SGLang's draft runs the unfused one: within the kernels' bounds, so DSpark's
-acceptance with and without the switch is the gate.
+A routed draft step (a block of rows a request, run as a TARGET_VERIFY batch) runs
+``_Draft.forward``, which takes and returns what ``DeepseekV4ForCausalLMDSpark.forward``
+does. Each stage is the target's K1 and K2 on the draft's route (128 experts, top-3, a
+FP4 group an ug task) and window (the 128-token window plus the block's keys); the
+last stage settles its post with SGLang's ``hc_post`` and the head's combine reads its
+pre, as SGLang's forward does. The stages' seams follow the fused mHC boundary's
+arithmetic where SGLang's draft runs the unfused one; the two agree within the
+kernels' bounds, so DSpark's acceptance with and without the switch is the gate.
 """
 
 from __future__ import annotations
@@ -17,12 +16,21 @@ from __future__ import annotations
 import re
 
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.deepseek_v41 import spec as target
@@ -34,10 +42,14 @@ _CKPT_SHARED = re.compile(
     r"mtp\.(?P<i>\d+)\.ffn\.shared_experts\.(?P<w>w[123])\.(?P<kind>weight|scale)"
 )
 
-# The SGLang names this module reads, by file under the sglang package (``f(p)``: a
-# parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
+# by file under sglang/ (``f(p)``: a parameter, ``"x"``: a literal); test_contract.py pins them
 SGLANG_READS = {
-    "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec", "Requirements"),
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "DeviceLimits",
+        "Feature",
+        "MonoSpec",
+        "Requirements",
+    ),
     "kernels/ops/layernorm/mhc.py": ("mhc_combine",),
     "srt/environ.py": ("envs", "SGLANG_DSPARK_EMBED_IN_GRAPH"),
     "srt/layers/logits_processor.py": (
@@ -123,22 +135,18 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             moe.experts.w13_weight, "is_shuffled", False
         ):
             reasons.append(f"stage {i}: needs {EXPERTS} experts in aiter's shuffle")
-        linears = [a.wqkv_a] if a.fuse_wqa_wkv else [a.wq_a, a.wkv]
-        if any(
-            getattr(lin, "aiter_bpreshuffled", False)
-            or getattr(lin, "mxfp8_native_ready", False)
-            for lin in linears + [a.wq_b, a.wo_a, a.wo_b]
-        ):
-            reasons.append(
-                f"stage {i}: an FP8 linear method reordered an attention weight in "
-                "place; K1 and K2 read them row-major"
-            )
+        reasons += target.attn_layout_reasons(f"stage {i}", a)
         if any(
             ("shared expert fp8", i, p, k) not in copies
             for p in target._SHARED
             for k in ("weight", "scale")
         ):
             unseen.append(i)
+    if target.shuffled_layout(s.self_attn for s in model.stages) is None:
+        reasons.append(
+            "wqkv / wq_b / wo_b are aiter-preshuffled on some stages and row-major "
+            "on others"
+        )
     if unseen:
         reasons.append(
             "the shared expert's FP8 checkpoint tensors were not seen at load "
@@ -180,10 +188,14 @@ class _Draft:
         lm = self.lm
         x = input_embeds
         if x is None:  # ``forward_embed``, from the target's whole table
+            if lm.embed_tokens is None:
+                raise ValueError(
+                    "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
+                    "(call attach_shared_modules first)."
+                )
             x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
             x = x.repeat(1, lm.hc_mult, 1)
-        # a stage's post folds into the next stage's K1 (as the target's layers do);
-        # the last stage settles its own
+        # a stage's post folds into the next stage's K1; the last stage settles its own
         pending, pre = (None, x, None, None), None
         for j, L in enumerate(self.stages):
             out = target._launch(
@@ -219,13 +231,13 @@ def _build(model, hf_config, ctx) -> _Draft:
         topk=TOPK,
         ug_groups=UG_GROUPS,
         swa_width=SWA_WIDTH,
+        shuffled=bool(target.shuffled_layout(s.self_attn for s in model.stages)),
     )
     runner.set_deadline(ctx.deadline_s)
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        # K1 on the first stage's settled residual, then folding the stage before's
-        # post; K2 on the window: no index source, no top-k
+        # K1 with and without an owed post; K2 on the window: no index source, no top-k
         runner.precompile(m, k1={(False, False), (True, False)}, k2={(False, False)})
     return _Draft(model, runner, stages)
 
@@ -240,12 +252,12 @@ SPEC = MonoSpec(
         )
     },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
-    # the launcher checks the target's requirements; the capture check, this
+    # the launcher checks the target's; SGLang checks the draft runner's at its first routed step
     requires=Requirements(attention_backends=target.SPEC.requires.attention_backends),
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     load_tensor=_load_tensor,
     tokens_per_request=_tokens_per_request,
 )

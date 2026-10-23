@@ -59,8 +59,7 @@ ARGS = COMMON + [
     "--max-running-requests",
     "8",
 ]
-# decode steps, a row a request, 16 at the largest width: 24 requests step past it;
-# HiCache loads a layer's pages while the launches before it run
+# a row a request: 24 requests step past the 16-row width; HiCache loads layers during launches
 DECODE_ARGS = COMMON + [
     "--cuda-graph-max-bs-decode",
     "24",

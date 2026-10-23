@@ -62,9 +62,7 @@ class RouteShape(msgspec.Struct, frozen=True):
     topk: int
     tokens: int
     tp: int
-    # FP4 groups (32 intermediate columns) an ug task, its waves splitting K in
-    # halves (2) or quarters (1): 1 is twice the tasks, so the CTAs' ug ends closer
-    # together, faster at the draft's widths (ROCm/ATOM, sgl-project/sglang#43984)
+    # FP4 groups an ug task: 1 (K quarters) doubles the tasks so CTAs end ug closer (sglang#43984)
     ug_groups: int = 2
 
     @property

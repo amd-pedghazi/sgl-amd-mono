@@ -1,23 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-M3 on gfx950: the monokernel spec and its forward (RFC #43949).
 
-SGLang's runtime switches the model's forward at attach: a routed decode or EAGLE3
-verify step runs ``_Built.forward`` here, which takes and returns what the model's
-forward does. The embedding and the leading dense-MLP layers run SGLang's modules;
-every sparse MoE layer is one launch (``gfx950/runner.py``), which takes the
-residual stream's pending pair (the all-reduced MLP output, its residual add not
-yet applied) and hands on the next one; SGLang's final norm and logits processor
-close the step. EAGLE3 reads each captured layer's input residual from the
-launch's K1 output, as SGLang's attention boundary would hand it.
-
-The kernels read SGLang's weights in place, except the copies logged at startup:
-the per-channel FP8 qkv / index and o_proj projections (the checkpoint keeps them
-in bf16), the bf16 router gate, the fp32 routing bias and the bf16 RoPE table.
-Pad rows write KV slot 0, the reserved dummy slot, as the normal path does.
-
-``SGLANG_AMD_MONO_CHECK=1`` runs SGLang's modules on a copy of every sparse layer's
-input before its launch, in eager steps, and logs both outputs' differences on the
-live rows (the bounds in ``NUMERICS`` come from these runs).
+A routed decode or EAGLE3 verify step runs ``_Built.forward``, which takes and returns
+what the model's forward does: SGLang's modules run the embedding and the leading
+dense-MLP layers, each sparse MoE layer is one launch (``gfx950/runner.py``) that takes
+and hands on the residual stream's pending pair (the all-reduced MLP output, its
+residual add not yet applied), and SGLang's final norm and logits processor close the
+step. The kernels read SGLang's weights in place except the copies logged at startup
+(``weights.py``). Pad rows write KV slot 0, the reserved dummy slot, as the normal path
+does. ``SGLANG_AMD_MONO_CHECK=1`` runs SGLang's modules on a copy of every sparse
+layer's input in eager steps and logs both outputs' differences on the live rows; the
+bounds in ``NUMERICS`` come from these runs.
 """
 
 from __future__ import annotations
@@ -27,14 +20,25 @@ import logging
 import os
 
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.minimax_m3 import HF_CONFIG, LAYER_LIMIT, SWIGLU_ALPHA
@@ -43,15 +47,12 @@ logger = logging.getLogger(__name__)
 
 MAX_ROWS = 16  # the rows a launch takes at most (``gfx950/config.MAX_TOKENS``)
 TP = 4
-# The fused shared expert's routing weight. SGLang's TopK gives it
-# sum(routed) / routed_scaling_factor and the MoE output is scaled back by
-# routed_scaling_factor, so with renormalized routed weights it contributes 1.0.
+# SGLang's sum(routed) / routed_scaling_factor, scaled back after the MoE, is 1 when renormalized
 SHARED_WEIGHT = 1.0
 
-# The SGLang names this glue reads, by file under the sglang package (``f(p)``: a
-# parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
+# by file under sglang/ (``f(p)``: a parameter, ``"x"``: a literal); test_contract.py pins them
 SGLANG_READS = {
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "MONOKERNEL_API_VERSION",
         "DeviceLimits",
         "Feature",
@@ -63,7 +64,9 @@ SGLANG_READS = {
         "tokens_per_request",
         "forward_mode",
     ),
-    "srt/monokernels/runtime.py": ('"target_verify"',),
+    "srt/kernel_plugins/amd/binding.py|srt/monokernels/runtime.py": (
+        '"target_verify"',
+    ),
     "srt/arg_groups/fields/*.py": (
         "kv_cache_dtype",
         "page_size",
@@ -153,13 +156,9 @@ SGLANG_READS = {
     "srt/configs/minimax_vl.py": ("text_config",),
 }
 
-# Each launch against SGLang's modules on the same input, with the attention
-# projections in FP8 where SGLang's are bf16 (check mode, 4 requests,
-# about 60k launches in each of two runs): the residual after the attention add on
-# every row, and the MLP output on the rows whose residuals route to SGLang's
-# experts. Median / p99 / worst: residual rel 0.006 / 0.021 / 0.063, row cosine
-# 0.99989 / p1 0.99953 / 0.99858; MLP output rel 0.038 / 0.097 / 0.33, row cosine
-# 0.998 / p1 0.937 / 0.64. The rare low MLP rows sit in layers 37-39 and 58.
+# check mode, 2 x ~60k launches, FP8 attention projections (SGLang's: bf16); median / p99 / worst:
+# residual, every row: rel 0.006 / 0.021 / 0.063, cosine 0.99989 / p1 0.99953 / 0.99858
+# MLP output, rows routed alike: rel 0.038 / 0.097 / 0.33, cosine 0.998 / p1 0.937 / 0.64
 NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
@@ -180,10 +179,8 @@ def _has_flydsl() -> bool:
     return importlib.util.find_spec("flydsl") is not None
 
 
-# The SGLang switches of the page16 SHUFFLE K / V the kernels read and write
-# (sgl-project/sglang#41998, on the AITER FP8 indexer of #41708), not yet in SGLang
-# main: read by name with a fallback, so an SGLang without them refuses the
-# monokernels with a reason. Pin them in SGLANG_READS once both merge.
+# switches of sgl-project/sglang#41998 (on #41708) for the page16 SHUFFLE K / V, not in main yet:
+# read by name, so an SGLang without them is refused with a reason; pin in SGLANG_READS once merged
 PENDING_ENV = {
     # prefill writes the page16 SHUFFLE K / V the kernels read
     "SGLANG_M3_USE_AITER_SPARSE_PA": True,
@@ -214,7 +211,7 @@ def _sparse_ids(model) -> list[int]:
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: the nested text config, the draft chain,
-    the HiCache transfer, FlyDSL, and the SHUFFLE K / V switches (PENDING_ENV)."""
+    KV offload, FlyDSL and the SHUFFLE K / V switches (``PENDING_ENV``)."""
     from sgl_amd_mono.minimax_m3.weights import selection_reasons
 
     t = _text(hf_config)
@@ -276,8 +273,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         return reasons + [
             "layer 0 is a MoE layer; the first launch needs a dense layer before it"
         ]
-    # the first launch takes the previous layer's MLP output with its residual add
-    # still pending; the kernel applies the add with its input norm
+    # the first launch's input norm applies the previous layer's pending add, which must be plain
     if not m.layers[sparse[0] - 1].ffn_boundary.declaration.update.is_plain_add:
         reasons.append(f"layer {sparse[0] - 1} hands on a non-additive residual")
     attn = m.layers[sparse[0]].self_attn
@@ -352,8 +348,7 @@ class _Built:
             if ref is not None:
                 _log_check(m.layers[lid], lid, slots[:rows] > 0, (ar, residual), ref)
             if getattr(m.layers[lid], "_is_layer_to_capture", False):
-                # K1's residual after the input add, before the norm: what the
-                # attention boundary hands EAGLE3 (the collector copies the buffer)
+                # the pre-norm residual the attention boundary hands EAGLE3; capture() copies it
                 aux.capture(r.h[:rows])
         stream.write(residual)
         last = m.layers[self.sparse[-1]]
@@ -362,9 +357,10 @@ class _Built:
         return hidden, (aux if len(aux) else None)
 
     def _reference(self, lid, positions, forward_batch, ar, residual):
-        """Check mode: SGLang's layer ``lid`` on a copy of the launch's input pair,
-        on a stream of its own; its (MLP output, residual) as the launch returns
-        them. It writes the same KV slots, which the launch then writes again."""
+        """Check mode: SGLang's layer ``lid`` on a copy of the launch's input pair.
+
+        Runs on a residual stream of its own and returns (MLP output, residual) as the
+        launch does. It writes the same KV slots, which the launch then writes again."""
         from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 
         layer = self.model.layers[lid]
@@ -383,8 +379,10 @@ class _Built:
             forward_batch.residual_stream = original
 
     def _bind(self) -> None:
-        """At the first routed forward, which every rank runs eagerly together: the
-        caches SGLang sized after the build, checked, agreed across ranks, bound."""
+        """Check and bind SGLang's caches at the first routed forward.
+
+        Every rank runs that forward eagerly together, after SGLang sized the caches;
+        the ranks gather each other's reasons, so all refuse or none does."""
         import torch.distributed as dist
         from sglang.srt.layers.attention.minimax_sparse_backend import (
             MiniMaxHybridAttnBackend,
@@ -421,10 +419,11 @@ def _routed_experts(layer, residual: torch.Tensor) -> torch.Tensor:
 
 
 def _log_check(layer, lid: int, live: torch.Tensor, got, ref) -> None:
-    """Check mode: the launch's outputs against SGLang's on the step's live rows:
-    the largest difference over the largest reference value, the least row cosine.
-    The MLP output is compared on the rows whose residuals route to the same
-    experts; a row routed elsewhere differs by construction, and is counted."""
+    """Check mode: log the launch's outputs against SGLang's on the step's live rows.
+
+    Per output, the largest difference over the largest reference value and the least
+    row cosine. The MLP output is compared on the rows whose residuals route to the
+    same experts: a row routed elsewhere differs by construction, and is counted."""
     if not bool(live.any()):
         return
     alike = (
@@ -481,8 +480,7 @@ def _build(model, hf_config, ctx) -> _Built:
         k4_build=k4_build,
     )
     runner.set_deadline(ctx.deadline_s)
-    # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
-    # another rank built (a lock per kernel), so each rank starts at its own share.
+    # FlyDSL's disk cache hands a rank its peers' builds, so each rank starts at its own share
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for rows in widths[start:] + widths[:start]:
@@ -531,6 +529,6 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
 )

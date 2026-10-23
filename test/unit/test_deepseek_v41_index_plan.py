@@ -1,8 +1,7 @@
-"""K2i's per-step score tasks on CPU (RFC #43949): ``index_plan`` lays out the
-scorer's tasks from the rows' column bounds alone, and the kernel calls the same
-functions on traced values. On Python ints and random steps: the host walk plan
-fits the grid and covers every scored row's chunks exactly once, and a candidate
-consumer's tasks tile its chunks."""
+"""K2i's per-step score tasks (``index_plan``, which the kernel traces too) on CPU (RFC #43949).
+
+On random steps: the host walk plan fits the grid and covers every scored row's chunks exactly
+once, and a candidate consumer's tasks tile its chunks."""
 
 import numpy as np
 import pytest

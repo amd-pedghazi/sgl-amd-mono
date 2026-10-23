@@ -48,8 +48,7 @@ def _spin(load_all, pending):
     v = load_all()
     stop = fx.Int32(0)  # 1: this wait timed out; 2: a failure elsewhere
     if const_expr(g.fault_site == site):
-        # SGLANG_AMD_MONO_FAULT_INJECT: once armed, this rank stalls here until
-        # the deadline
+        # SGLANG_AMD_MONO_FAULT_INJECT: once armed, this rank stalls here until the deadline
         armed = g.armed()
         t0 = guard.clock()
         deadline = deadline_of()
@@ -58,9 +57,8 @@ def _spin(load_all, pending):
             v = load_all()
             late = (guard.clock() - t0) > deadline
             stop = late.select(fx.Int32(1), stopped().select(fx.Int32(2), fx.Int32(0)))
-    # A satisfied wait costs nothing more, and so does a pending one that the data
-    # reaches within CHECK_POLLS polls. A longer one checks the failure flags every
-    # CHECK_POLLS polls, and its deadline from the first of those checks.
+    # a wait the data reaches within CHECK_POLLS polls checks nothing; the deadline
+    # runs from the first check
     t0 = fx.Int64(0)
     polls = fx.Int32(0)
     while pending(v) & (stop == 0):

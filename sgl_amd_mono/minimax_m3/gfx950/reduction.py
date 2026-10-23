@@ -11,15 +11,14 @@ from sgl_amd_mono.common.ops import butterfly
 
 @flyc.jit
 def ar_block_sums(parts, lane, wave, red):
-    """Per row ``(p0, p1)`` of ``parts``, the sum of the 768 per-pack partials of a
-    6144-wide bf16 row in the order the 1-stage fused all-reduce + RMSNorm reduces
-    them: 24 warps of 32, a 16..1 butterfly per warp, then the 24 warp sums
-    butterflied again in one warp. Every row goes behind one set of barriers.
+    """Per row ``(p0, p1)`` of ``parts``, the sum of a 6144-wide bf16 row's 768 per-pack
+    partials in the 1-stage fused all-reduce + RMSNorm's order, so rstd is bit-exact
+    with the unfused path.
 
-    Logical warp ``3 * wave + lane // 32`` holds ``p0``; logical warp
-    ``3 * wave + 2`` holds ``p1`` in lanes < 32 (``WAVES`` = 8). ``red`` needs
-    24 words per row. Matching this order keeps rstd bit-exact with the unfused
-    path.
+    24 warps of 32, a 16..1 butterfly per warp, then the 24 warp sums butterflied again
+    in one warp; every row goes behind one set of barriers. Logical warp
+    ``3 * wave + lane // 32`` holds ``p0``; logical warp ``3 * wave + 2`` holds ``p1``
+    in lanes < 32 (``WAVES`` = 8). ``red`` needs 24 words per row.
     """
     bs = [
         (butterfly(p0, (16, 8, 4, 2, 1)), butterfly(p1, (16, 8, 4, 2, 1)))

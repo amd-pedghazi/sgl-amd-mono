@@ -4,32 +4,17 @@
 # atom/models/deepseek_v41/mono/kernels/index_score_fp4.py, by way of
 # sgl-project/sglang#43984 at 134919476c (``_keys`` reads SGLang's page-64 FP4 index
 # plane through virtual 8-row pages)
-"""K2a's indexer scores on the FP4 index plane: 8-row pages in the row-group
-layout (aiter ``pa_mqa_logits_fp4_rowgroup``, page 8), E2M1 keys with an E8M0
-per 32 dims, E2M1 queries with theirs. The logits land in ``ilog``, where
-SGLang's top-k reads them.
+"""K2a's indexer logits on SGLang's FP4 index plane, bit for bit with aiter's row-group kernel.
 
-    kv  SGLang's [pages64, 4 (K chunk), 64 (key), 16 B], read through virtual
-        8-row pages (``_keys``)
-    ks  SGLang's [pages64, 4 (K chunk), 64 (key % 16 * 4 + key // 16)] E8M0
-    iq  [S, HEADS, DIM / 2] E2M1, iqs [S, 4 (K chunk), 16 (head % 16), 4
-        (head // 16, padded)] E8M0, iw [S, HEADS] bf16 (SGLang's head weights,
-        widened to f32 as they are staged: exact)
+    kv  SGLang's [pages64, 4 (K chunk), 64 (key), 16 B] E2M1, read as virtual 8-row pages
+    ks  SGLang's [pages64, 4 (K chunk), 64 (key % 16 * 4 + key // 16)] E8M0, one per 32 dims
+    iq  [S, HEADS, DIM / 2] E2M1, iqs [S, 4 (K chunk), 16 (head % 16), 4 (head // 16, padded)]
+        E8M0, iw [S, HEADS] bf16 (widening to f32 is exact)
 
-A task is a piece -- up to WALK_ROWS adjacent tokens on one page table -- and
-a run of chunks, a CTA's: a FULL layer's from the step's host plan
-(``index_plan.fill_walk_plan``, one descriptor a CTA in ``iplan``), a REINDEX
-layer's (a token a piece, ``index_plan.reindex_split``) from the CTA index
-alone.
-The CTA stages the piece's query rows in LDS and its waves walk the task's
-64-key steps side by side, DEPTH steps of keys in flight. A wave scores every
-row of the piece off each key load (one 16x16x128 scaled MFMA per row, head
-tile and key tile); lane (g, l) of tile nt holds key 4 l + nt, so its page is
-looked up once a step and its four tiles' scales are one dword. Two
-permlane32 swaps and a permlane16 swap leave lane (g, l) with key 4 l + g's
-logit: one dword store a row covers the step. The row-group kernel's
-arithmetic, step for step (relu as x + |x| against half the weight, the
-lane's heads in one fma chain, then the swaps): its logits bit for bit.
+Lane (g, l) of tile nt holds key 4 l + nt, so a step's page is one lookup and its four tiles'
+scales one dword. The logits match aiter ``pa_mqa_logits_fp4_rowgroup`` only in its arithmetic
+order: relu as x + |x| against half the weight, the lane's heads in one fma chain, then the
+permlane swaps that leave lane (g, l) key 4 l + g's logit.
 """
 
 import flydsl.compiler as flyc
@@ -57,14 +42,13 @@ from . import index_plan as ip
 PAGE = ip.BLOCK_ROWS
 PAGE_BYTES = PAGE * ip.DIM // 2
 PAGE_SCALES = PAGE * ip.DIM // 32
-# SGLang's FP4 index plane (``deepseek_v4_memory_pool``): 64-row pages, payload and scales in buffers of their own
+# SGLang's FP4 index plane (``deepseek_v4_memory_pool``): 64-row pages, payload and scales apart
 PLANE_ROWS = 64
 PLANE_CHUNK_BYTES = PLANE_ROWS * 16
 PLANE_PAGE_BYTES = PLANE_ROWS * ip.DIM // 2
 PLANE_PAGE_SCALES = PLANE_ROWS * ip.DIM // 32
 M_TILES = ip.HEADS // 16
-# a row in LDS (words): its E2M1 query, its E8M0 scales (iqs), its weights;
-# the rows, then their bounds
+# LDS (words): each row's E2M1 query, E8M0 scales and weights, then the rows' bounds
 Q_WORDS, QS_WORDS = ip.HEADS * ip.DIM // 8, ip.HEADS * 2
 ROW_WORDS = Q_WORDS + QS_WORDS + ip.HEADS
 BOUNDS_AT = ip.WALK_ROWS * ROW_WORDS
@@ -93,16 +77,18 @@ def _vop(asm, *args):
 
 
 def _sload4(addr):
-    """Four words at a wave-uniform address, a scalar load (the constant
-    address space): the scalar cache's round trip, not the vector memory's."""
+    """Four words at a wave-uniform address as a scalar load (the constant address space).
+
+    The scalar cache's round trip is shorter than the vector memory's."""
     ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), as_ir_value(addr)).result
     v = fx.Vector(llvm.LoadOp(T.vec(4, T.i32), ptr, alignment=16).result)
     return [v[k] for k in range(4)]
 
 
 def _read_all(args):
-    """The kernel arguments read here: LLVM loads one where it is first used, so
-    the walk's first reads would wait on a scalar-load trip."""
+    """Read every kernel argument up front.
+
+    LLVM loads one where it is first used, so the walk's first reads would wait on a scalar load."""
     vals = [as_ir_value(v) for v in args if not isinstance(v, int)]
     llvm.inline_asm(
         T.i32, vals, "s_mov_b32 $0, 0", "=s" + ",s" * len(vals),
@@ -125,26 +111,21 @@ def _lds_barrier():
 
 @flyc.jit
 def _stage_rows(c, lead, span, first_keys=None):
-    """The piece's rows into LDS, read once a CTA (every wave reading its own
-    copy put the CTA's waves on the same lines at once): thread u <
-    ROW_WORDS / 4 of the waves that hold one reads 16 B of each row's query,
-    scale and weight words, and the rows' bounds (0 past the span); only those
-    waves (the others' copies queued ahead of their own key reads in the CU's
-    memory pipeline). ``first_keys`` (a walk's ``init``, when issued before
-    the barrier) go out between those reads and their stores: a store waits on
-    its read. Reads, keys and stores in one branch (a store behind it let LLVM
-    sink the reads past the keys)."""
+    """Stage the piece's rows and bounds (0 past the span) into LDS, once a CTA, from ROW_WAVES.
+
+    Per-wave copies put the CTA's waves on the same lines at once and queue ahead of their key
+    reads. ``first_keys`` go out between the reads and their stores, as a store waits on its read,
+    all in one branch: a store after it lets LLVM sink the reads past the keys."""
     a, tid = c["args"], c["tid"]
     lds = c["rows_lds"]
     q_units, qs_units = ip.HEADS * ip.DIM // 32, ip.HEADS * 2 // 4
     w_units = q_units + qs_units  # from here, a unit holds 4 heads' f32 weights
-    # (the branches' result: a value of its type first)
+    # the branch's result needs a value of its type before it
     zero4 = fx.Vector.filled(4, 0, fx.Int32)
     init = ([zero4] * 4 + [fx.Int32(0)]) * DEPTH + [fx.Int32(0)] * DEPTH
     if tid < ROW_WAVES * 64:
         u = fx.min(tid, ROW_WORDS // 4 - 1)
-        # the weights are bf16: 16 B hold 8 heads, so two units read one line
-        # and each widens its half (bf16 -> f32 is exact)
+        # bf16 weights: two units read one 16 B line of 8 heads, each widening its half (exact)
         wu = fx.max(u - w_units, 0)
         is_w, low_half = u >= w_units, (wu % 2) == 0
         got = []
@@ -191,9 +172,9 @@ def _stage_rows(c, lead, span, first_keys=None):
 
 
 def _rows(c, rows):
-    """The piece's first ``rows`` rows as a wave holds them, from LDS:
-    (bound, query operands [mi], scale dword, half-weights [mi][e]) a row;
-    rows past the span repeat its last and write nothing (bound 0)."""
+    """The piece's first ``rows`` rows from LDS: (bound, query [mi], scale dword, half-weights).
+
+    Rows past the span repeat its last with bound 0, so they write nothing."""
     lane, lds = c["lane"], c["rows_lds"]
     l, g = lane % 16, lane // 16
     v4 = fx.Vector.make_type(4, fx.Int32)
@@ -217,9 +198,10 @@ def _rows(c, rows):
 
 
 def _page(c, trow, st):
-    """This lane's page of step st: keys 4 l .. 4 l + 3, off table row
-    ``trow``, whose entries name 2 ** ishift pages each (a request's PAGE
-    table; a REINDEX token's candidates, ishift 0)."""
+    """This lane's virtual page of step st (keys 4 l .. 4 l + 3), off table row ``trow``.
+
+    An entry names 2 ** ishift pages: a request's page table, or a REINDEX token's candidates
+    (ishift 0)."""
     a, l = c["args"], c["lane"] % 16
     shift = a["ishift"]
     blk = fx.min(st * (ip.STEP // PAGE) + l // 2, (a["itab_len"] << shift) - 1)
@@ -228,18 +210,16 @@ def _page(c, trow, st):
 
 
 def _keys(c, page, nt):
-    """A step's four key tiles (16 B a lane each) and their scales (a dword);
-    ``nt``: nontemporal, for keys no other wave reads (a piece's rows all on
-    one wave) -- not a REINDEX row's candidate pages, its request's other
-    rows' too."""
+    """A step's four key tiles (16 B a lane each) and their scales (a dword).
+
+    ``nt`` loads nontemporal, for keys no other wave reads (a piece's rows on one wave); not for a
+    REINDEX row, whose request's other rows read the same candidate pages."""
     a, lane = c["args"], c["lane"]
     l, g = lane % 16, lane // 16
-    # ``page`` is virtual: 8 x SGLang's 64-row page + the 8-row sub page. Its
-    # payload is [chunk][slot][16 B], so the lane's 4 keys (slots 8 sub + 4 (l % 2)
-    # + nt) are 64 contiguous bytes; its scales are [chunk][(slot % 16) * 4 +
-    # slot // 16], so key nt's byte is 4 nt + sub // 2 of one 16 B line
+    # ``page`` is virtual: 8 x SGLang's 64-row page + the 8-row sub page
     sub = page & 7
     phys = fx.Int64(page >> 3)
+    # payload [chunk][slot][16 B]: the lane's keys (slots 8 sub + 4 (l % 2) + nt) are 64 B in a row
     # 64-bit addresses: a pool past 4 GiB is out of a buffer offset's reach
     base = (
         a["plane"]
@@ -247,6 +227,7 @@ def _keys(c, page, nt):
         + fx.Int64(g * PLANE_CHUNK_BYTES + (sub * 8 + (l % 2) * 4) * 16)
     )
     kv = [global_load(base + t * 16, 4, nt) for t in range(4)]
+    # scales [chunk][(slot % 16) * 4 + slot // 16]: key nt's byte is 4 nt + sub // 2 of one line
     line = global_load(
         a["pscale"]
         + phys * PLANE_PAGE_SCALES
@@ -278,8 +259,7 @@ def _step(c, rows, outs, kv, kvs, st, after_mfmas):
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
     per_tile = []
     for nt in range_constexpr(4):
-        # raised while a tile's MFMAs issue, so the SIMD's other wave is not
-        # interleaved into the burst
+        # raised while a tile's MFMAs issue, so the SIMD's other wave does not interleave
         rocdl.s_setprio(1)
         accs = [
             [
@@ -318,13 +298,13 @@ def _step(c, rows, outs, kv, kvs, st, after_mfmas):
 
 @flyc.jit
 def _walk(c, lead, trow, count, step_of, init, rows_n):
-    """This wave's ``count`` steps ``step_of(k)`` of the piece's first
-    ``rows_n`` rows, off the keys ``init`` holds in flight: DEPTH buffers,
-    each refilled with the keys DEPTH steps on right after its step's MFMAs;
-    pages a trip further ahead."""
+    """This wave's ``count`` steps ``step_of(k)`` of the piece's first ``rows_n`` rows.
+
+    DEPTH key buffers start from ``init``; each refills with the keys DEPTH steps on right after
+    its step's MFMAs, and pages are read a trip further ahead."""
     a = c["args"]
     rows = _rows(c, rows_n)
-    # a row's window: its bound, so columns past it are dropped
+    # a row's buffer ends at its bound, so stores past it are dropped
     outs = [
         rsrc(
             a["ilog"] + fx.Int64(lead + r) * fx.Int64(a["lstride"]) * 4,
@@ -332,8 +312,7 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
         )
         for r in range(rows_n)
     ]
-    # (names bound out here must not be rebound in the loop body, or the
-    # rewriter carries them as loop state)
+    # names bound out here must not be rebound in the loop, or the rewriter carries them as state
     trips = count // DEPTH
     for j, state in range(0, fx.Int64(trips), 1, init=init):
         k0 = fx.Int32(j) * DEPTH
@@ -367,20 +346,15 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
 
 @flyc.jit
 def stage_iscore4(c, lead, span, ch0, ch1, rows):
-    """Chunks [ch0, ch1) of the ``span`` tokens from ``lead`` (a piece), each
-    wave holding ``rows`` (a build constant: WALK_ROWS, or 1 for a REINDEX
-    token).
+    """Chunks [ch0, ch1) of the piece of ``span`` tokens from ``lead``, a wave holding ``rows``.
 
-    A piece of WALK_ROWS issues its first keys after the rows' barrier (before
-    it, the younger wave of each SIMD pair waited 1.8 us to issue its own
-    behind the older one's); a REINDEX token's go out before it."""
+    A WALK_ROWS piece issues its first keys after the rows' barrier, since before it each SIMD
+    pair's younger wave waits behind the older one's; a REINDEX token (``rows`` 1) issues before."""
     wave = c["wave"]
     s_lo = ch0 * (ip.CHUNK // ip.STEP)
     nt = rows > 1
 
-    # a SIMD's two waves (w, w + WAVES / 2) split one stream of every
-    # (WAVES / 2)-th step, the older taking OLDER_SHARE of it: issue goes to
-    # the older wave first, and on equal shares it finished ~11% ahead
+    # SIMD pair w, w + WAVES / 2 splits its steps, the older taking more as issue goes to it first
     pair, older = wave % (WAVES // 2), wave < WAVES // 2
     n_pair = ch1 * (ip.CHUNK // ip.STEP) - s_lo - pair
     n_pair = (n_pair > 0).select((n_pair + WAVES // 2 - 1) // (WAVES // 2), 0)
@@ -405,8 +379,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, rows):
         _lds_barrier()
     lds = c["rows_lds"]
     bounds = [fx.ptr_load(lds + (BOUNDS_AT + r)) for r in range(ip.WALK_ROWS)]
-    # steps up to the rows' last scored chunk, from the bounds in LDS: the
-    # first reads went out before them, on the chunks alone
+    # steps up to the rows' last scored chunk: the first reads went out on the chunks alone
     top = ip.score_chunks(bounds[0])
     for r in range_constexpr(1, ip.WALK_ROWS):
         top = fx.max(top, ip.score_chunks(bounds[r]))
@@ -419,11 +392,11 @@ def stage_iscore4(c, lead, span, ch0, ch1, rows):
 
 @flyc.jit
 def run_scores4(c, s, bid):
-    """The FP4 score stage: this CTA's task, if any. A FULL layer's comes from
-    the step's host plan (``iplan``: (lead, span, ch0, ch1) a CTA, span 0 for
-    none); a REINDEX layer's from the CTA index alone
-    (``index_plan.reindex_split``): the walk stops at a token's bound, read
-    with the first keys."""
+    """The FP4 score stage: this CTA's task, if any.
+
+    A FULL layer's is its ``iplan`` row (lead, span, ch0, ch1; span 0 for none); a REINDEX
+    layer's comes from the CTA index alone (``index_plan.reindex_split``) and stops at the
+    token's bound, read with the first keys."""
     a = c["args"]
     _read_all(a.values())
     if a["reindex"] != 0:

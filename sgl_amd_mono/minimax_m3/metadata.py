@@ -16,14 +16,13 @@ def prepare_token_rows(
     is_verify: bool,
     max_context_len: int,
 ):
-    """Expand each request to query_len rows without exposing future tokens.
+    """Expand each request to ``query_len`` rows without exposing future tokens.
 
-    SGLang TARGET_VERIFY seq_lens contain the accepted prefix, unlike ATOM's
-    total sequence lengths. Query j therefore sees prefix + j + 1 keys.
-    These tensor operations run inside the captured graph on every replay.
-    Slot 0 is reserved for graph padding by the KV allocator; negative slots
-    also skip cache writes. Keep these rows empty after the causal-length
-    arithmetic so they cannot join the mono kernel's wide-MoE expert union.
+    SGLang's TARGET_VERIFY ``seq_lens`` hold the accepted prefix (ATOM's hold the total
+    length), so query j sees prefix + j + 1 keys. It runs in the captured graph, fresh
+    on every replay. A row whose slot is 0 (the KV allocator's graph padding) or
+    negative (no cache write) is zeroed after the causal arithmetic, so it cannot join
+    the wide MoE's expert union.
     """
     n = out_seq_lens.numel()
     token = torch.arange(n, dtype=torch.int64, device=seq_lens.device)
@@ -34,9 +33,7 @@ def prepare_token_rows(
     lengths = seq_lens[request]
     if is_verify:
         lengths = lengths + (token % query_len + 1).to(lengths.dtype)
-        # The scheduler discards speculative lookahead past the model's
-        # context limit. Keep those unused rows in bounds as graph padding;
-        # all queries inside the configured context retain their exact length.
+        # the scheduler drops lookahead past the context limit: those rows need only stay in bounds
         lengths = lengths.clamp(max=max_context_len)
     out_seq_lens.copy_(lengths)
     padding = slot_mapping[:n] <= 0

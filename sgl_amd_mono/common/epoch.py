@@ -34,7 +34,7 @@ def gstore(addr, value, words=4):
 
 
 def spin_until(load, pending):
-    """``load()`` again (s_sleep between) while ``pending(value)``; the value."""
+    """Poll ``load()``, sleeping between, until ``pending`` clears; return the value."""
     return _spin(load, pending)
 
 

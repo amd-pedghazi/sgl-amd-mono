@@ -46,9 +46,7 @@ MAX_TOKENS = 16  # tokens one mono step serves (the MFMA B operand holds 16)
 TP = 4
 # indexer context parallelism: a rank computes every index q head
 MAX_QKV_ROWS = qkv_rows(TP)
-# indexer context parallelism serves a request past this many index blocks: its
-# selection costs a fixed overhead that the one-head path's O(n^2) ranking only
-# exceeds beyond here
+# indexer CP from here: below it the one-head O(n^2) ranking costs less than CP's fixed overhead
 INDEX_CP_FROM_BLOCKS = 288
 
 

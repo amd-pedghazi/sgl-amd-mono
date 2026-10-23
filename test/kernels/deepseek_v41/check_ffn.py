@@ -8,16 +8,15 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sgl_amd_mono.deepseek_v41.spec import NUMERICS
+from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 HIDDEN, HC, MIX = 5120, 4, 24
 E, TOPK, SCALE, LIMIT = 384, 6, 1.5, 10.0
-# --draft: the DSpark draft's route (128 experts, top-3, a FP4 group an ug task) at
-# its block widths (5 rows a request)
+# --draft: the DSpark draft's route (one FP4 group an ug task) at its widths, 5 rows a request
 DRAFT_ROUTE = dict(experts=128, topk=3, ug_groups=1)
 DRAFT_WIDTHS = (5, 10, 15, 20, 25, 30, 35, 40)
 INTER, PAD = 2304, 128
-WIDTHS = (1, 2, 4, 8, 12, 16, 24, 32, 40, 48)  # every decode graph width <= 48
+WIDTHS = SPEC.devices["gfx950"].widths
 RMS_EPS, HC_EPS = 1e-20, 1e-6
 MIX_RTOL = NUMERICS.bound("ffn.mix.rel")
 FP4 = [
@@ -85,7 +84,7 @@ def term_ulps(out, ref, big):
 
 # ---------------------------------------------------------------- MX helpers (the launch's rules)
 def code_ceil(v):
-    """Biased exponent of the smallest power of two >= v (v > 0), clamped to [lo, 254]."""
+    """Biased exponent of the smallest power of two >= v (v > 0)."""
     bits = v.float().contiguous().view(torch.int32)
     return ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()
 
@@ -210,9 +209,7 @@ def golden_partial(x, w, inter, padded):
     """This rank's MoE partial of bf16 rows ``x``: routed (top-k order, bf16 at every add) + shared."""
     ids, wts = routing(x, w)
     xr, xs = mxfp8_qdq(x, "aiter"), mxfp8_qdq(x, "vllm")
-    per_k = torch.zeros(
-        x.shape[0], TOPK, HIDDEN, device=x.device
-    )  # a row's contributions, top-k order
+    per_k = torch.zeros(x.shape[0], TOPK, HIDDEN, device=x.device)
     for e in ids.unique().tolist():
         rows, ks = (ids == e).nonzero(as_tuple=True)
         h = xr[rows] @ deq_fp4(w["w13_raw"][e], w["s13_raw"][e]).T
@@ -283,8 +280,7 @@ FFN_MARKS = {
 
 
 def timeline_report(M, tl) -> str:
-    """Each mark: µs after the first CTA started (median CTA, last CTA); then each
-    stage's own µs across CTAs (median, max) and on the CTA that ends last."""
+    """Each mark's µs after the first CTA's start, then each stage's µs, across CTAs."""
     t0 = tl[:, 16].min()
     marks = list(FFN_MARKS)
     lines = [f"M={M} timeline, us after the first CTA's start (median CTA / last CTA):"]
@@ -381,7 +377,7 @@ def main():
         err, err_sgl = term_ulps(res_o, ref64, big), term_ulps(res2, ref64, big)
         checks = {
             "residual exact": torch.equal(res_o, res2),
-            # the same fp32 math in another order: error in ulps of each element's largest term vs an fp64 hc_post
+            # fp32 math in another order: error in ulps of the largest term against an fp64 hc_post
             "residual err <= SGLang's + 0.5 ulp, <= 0.01% differ": err <= err_sgl + 0.5
             and res_share <= 1e-4,
             "post": torch.allclose(post_o.view(M, HC), post2, rtol=MIX_RTOL, atol=1e-5),

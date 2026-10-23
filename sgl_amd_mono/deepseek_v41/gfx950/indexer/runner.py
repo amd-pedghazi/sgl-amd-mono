@@ -1,23 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from sgl-project/sglang#43984 at 134919476c (kernels/ops/mono/gfx950/
 # deepseek_v41/indexer/runner.py)
-"""K2i's host side on one rank, owned by the target's runner
-(``DSV41MonoRunner.enable_k2i``): the buffers (graph safe: every tensor a replayed
-launch reads or writes lives here), each width's build, the per-step walk plans,
-and an index source's selection (``K2iRunner.select``): K2i's logits, then
-SGLang's top-k kernels on them.
+"""K2i's host side on one rank (``DSV41MonoRunner.enable_k2i``): K2i's logits, then SGLang's top-k.
 
-An index source selects in one of three kinds:
-
-- ``full``: K2i scores every visible column of each row, SGLang's top-k keeps 512.
-- ``producer``: ``full``, and SGLang's candidate blocks of the logits (the
-  candidate source of a two-level step), which the step's ``reindex`` layers read.
-- ``reindex``: K2i scores only the candidate blocks' columns (a candidate
-  consumer), SGLang's top-k keeps 512 of them, and ``candidate_table`` maps them
-  back to positions and slots.
-
-The selection lands in SGLang's ``sparse_raw_indices`` / ``sparse_page_indices``
-of the layer's compress ratio, -1 padded, as K2 reads it."""
+Every tensor a replayed launch reads or writes lives here, so captured graphs stay valid. A
+``full`` source keeps SGLang's top 512 of every visible column; a ``producer`` also publishes
+SGLang's candidate blocks of its logits; a ``reindex`` source scores only those blocks' columns
+and maps its top 512 back to positions and slots (``candidate_table``)."""
 
 from __future__ import annotations
 
@@ -32,7 +21,7 @@ from .candidate_table import PLANE_ROWS, map_compact_selection, reindex_table
 from .k2i import MAX_ROWS, build_k2i
 from .walk_plan import fill_walk_plan_device, new_plan
 
-# The SGLang names this module reads (test/unit/test_contract.py pins them)
+# the SGLang names this module reads, pinned by test/unit/test_contract.py
 SGLANG_READS = {
     "kernels/ops/attention/dsv4/candidate_blocks_hip.py": (
         "select_candidate_blocks_hip",
@@ -47,7 +36,7 @@ SGLANG_READS = {
         "topk_transform_paged_hip(page_indices)",
         "topk_transform_paged_hip(page_size)",
         "topk_transform_paged_hip(raw_indices)",
-        # CandidateBlocks: the candidate source's blocks of each row
+        # ``CandidateBlocks.ids``
         "ids",
     ),
 }
@@ -61,8 +50,7 @@ def _roundup(x: int, m: int) -> int:
 
 
 def check_plane(*, payload: torch.Tensor, scale: torch.Tensor) -> None:
-    """Raise unless the index plane is SGLang's split FP4 layout of 64-row pages:
-    payload [pages, 1, 4, 64, 16 B], scales [pages, 1, 4, 64]."""
+    """Raise unless the index plane is SGLang's split FP4 layout of 64-row pages."""
     u8 = payload.view(torch.uint8)
     pages = scale.shape[0]
     if not (
@@ -88,12 +76,11 @@ class K2iRunner:
         i32 = dict(dtype=torch.int32, device=device)
         self.bound_max = _roundup(max(bound_max, COMPACT), ip.CHUNK)
         self.ilog = torch.empty(MAX_ROWS * self.bound_max, **f32)
-        # a REINDEX layer's candidate blocks (newest last), their key table and
-        # the compact columns each row reads (``reindex_table``)
+        # ``reindex_table``'s outputs: blocks newest last, their key table, each row's columns
         self.cand_ids = torch.empty(MAX_ROWS, ip.TOPK_BLOCKS, **i32)
         self.cand_table = torch.empty(MAX_ROWS, ip.TOPK_BLOCKS, **i32)
         self.cand_bound = torch.empty(MAX_ROWS, **i32)
-        # its top-k of the compact columns, as one page at slot 0: a column is its slot
+        # the compact top-k as one page at slot 0, so a column is its own slot
         self.compact_pos = torch.empty(MAX_ROWS, ip.TOPK, **i32)
         self.compact_table = torch.zeros(MAX_ROWS, 1, **i32)
         self.plans = {ratio: new_plan(device) for ratio in (1, 2)}
@@ -115,9 +102,9 @@ class K2iRunner:
     def walk_plan(
         self, *, ratio: int, bounds: torch.Tensor, rows: int, per_req: int
     ) -> None:
-        """The step's FULL walk plan of compress ratio ``ratio`` from the rows'
-        device bounds: once a step and ratio, before its first FULL or producer
-        layer (each reads it)."""
+        """Lay out the step's FULL walk plan for compress ratio ``ratio`` from device bounds.
+
+        Once a step and ratio, before its first FULL or producer layer, which both read it."""
         fill_walk_plan_device(
             bounds=bounds,
             owners=self.owners[per_req - 1],
@@ -141,9 +128,10 @@ class K2iRunner:
         candidates=None,  # a REINDEX layer's: the producer's CandidateBlocks
         reindex_table_built=False,  # a later REINDEX layer of the step: table kept
     ):
-        """An index source's top-512 of each row (``kind`` in KINDS). A FULL or
-        producer layer reads the step's walk plan of ``ratio``; a producer returns
-        its candidate blocks, which the step's REINDEX layers take."""
+        """An index source's top-512 of each row (``kind`` in KINDS).
+
+        FULL and producer layers read the step's walk plan of ``ratio``; a producer returns its
+        candidate blocks for the step's REINDEX layers."""
         assert kind in KINDS, kind
         _check(
             rows=rows, per_req=per_req, query=query, page_table=page_table,
@@ -196,9 +184,9 @@ class K2iRunner:
     def score(
         self, *, rows, per_req, ratio, query, plane, page_table, bounds
     ) -> torch.Tensor:
-        """A FULL or producer layer's logits, [rows, width] f32, valid below each
-        row's bound; ``width`` is the page table's columns, as wide as SGLang's
-        logits for its top-k."""
+        """A FULL or producer layer's logits [rows, width] f32, valid below each row's bound.
+
+        ``width`` spans the page table's columns, as wide as SGLang's logits for its top-k."""
         width = min(page_table.shape[1] * PLANE_ROWS, self.bound_max)
         # a page-table entry is 8 virtual 8-row pages (ishift 3)
         self._score(
@@ -213,10 +201,10 @@ class K2iRunner:
         self, *, candidates, rows, per_req, query, plane, page_table, bounds,
         table_built=False,
     ):  # fmt: skip
-        """A REINDEX layer's logits of its candidate blocks' columns: (compact
-        [rows, COMPACT] f32, valid below ``lens``; lens [rows]; ids [rows,
-        TOPK_BLOCKS]: ``candidates.ids`` with the newest block last, column j * 8 + i
-        being row i of block ids[j])."""
+        """A REINDEX layer's logits of its candidate blocks' columns -> (compact, lens, ids).
+
+        ``ids`` is ``candidates.ids`` with the newest block last; compact column j * 8 + i is row
+        i of block ids[j], valid below ``lens``."""
         if tuple(candidates.ids.shape) != (rows, ip.TOPK_BLOCKS):
             raise RuntimeError(
                 f"K2i: candidate blocks {tuple(candidates.ids.shape)} for {rows} rows"
@@ -233,7 +221,7 @@ class K2iRunner:
                 table=self.cand_table,
                 context=lens,
             )
-        # a REINDEX launch takes its task from its CTA index, not a walk plan
+        # a REINDEX launch ignores the plan: its task comes from its CTA index
         self._score(
             rows=rows, query=query, plane=plane, plan=self.plans[1], itab=self.cand_table,
             itab_stride=ip.TOPK_BLOCKS, itab_len=ip.TOPK_BLOCKS, ibatch=owners, ishift=0,
@@ -245,7 +233,6 @@ class K2iRunner:
         self, *, rows, query, plane, plan, itab, itab_stride, itab_len, ibatch, ishift,
         ibound, lstride, reindex,
     ) -> None:  # fmt: skip
-        """The K2i launch (``k2i``'s arguments)."""
         q_fp4, q_scale, weights = query
         payload, scale = plane
         self.kernel(rows)(

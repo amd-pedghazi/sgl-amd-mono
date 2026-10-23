@@ -3,19 +3,10 @@
 """K2 ``back``: one DeepSeek-V4.1 attention layer from the rotated query to the
 rank's wo_b partial, adapted from vLLM's mono decode (``attention/back.py``).
 
-One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S rows:
-
-    split   (S x chunks of CK keys): flash-decoding over one chunk of a token's
-            keys (K1's key table: top-k compressed rows, then window rows) for
-            every head of the rank -> the chunk's bf16 partial and its (max, sum)
-            per head, published
-    combine (S x H): a (token, head)'s chunks merged with the sink folded in,
-            bf16, inverse GPT-J RoPE of dims 448.., MXFP8 of each 32 -> XO
-    wo_a    (G x 1024 / 32, two 16-row tiles): the group's XO rows times wo_a
-            -> bf16 -> MXFP8 of the 32 rows -> X8B (published)
-    wo_b    (320, 16 rows): X8B times wo_b -> bf16 -> the caller's hook
-
-Hand-offs are plain device-scope data behind tagged flags.
+One launch a layer and rank runs split (flash-decoding over a chunk of a token's
+keys from K1's key table, every head of the rank), combine (the chunks merged with
+the sink, inverse GPT-J RoPE -> bf16 XO), wo_a (-> MXFP8 X8B) and wo_b (-> the
+caller's hook); the stages hand off device-scope data behind tagged flags.
 """
 
 import flydsl.compiler as flyc
@@ -86,12 +77,10 @@ _STREAM = fx.Stream(None)
 NEG = -3.4028234663852886e38
 LOG2E = 1.4426950408889634
 REC = DATA + 8  # a raw record row in LDS: 576 data bytes + 8 scale bytes
-Q_ROW = (
-    HEAD_DIM // 2 + 4
-)  # a q row in LDS (i32 words): 512 bf16 + 16 B, no bank aliasing
+# a q row in LDS, i32 words: 512 bf16 + 16 B of pad, so rows do not alias banks
+Q_ROW = HEAD_DIM // 2 + 4
 P_PAD = 2  # i32 words past a P row: 16 head rows read together hit distinct banks
-# wo_a's K order: waves 0..3 / 4..7 take the two 16-row tiles, a contiguous K
-# range a wave, summed in wave order
+# wo_a's K order: waves 0..3 / 4..7 take the two 16-row tiles, a K range each, summed in wave order
 WOA_SPLIT_K = WAVES * ROWS // WOA_ROWS
 
 
@@ -100,6 +89,7 @@ class BackBuild(msgspec.Struct, frozen=True):
     tp: int
     ratio: int  # 0: window only; 1 / 2: top-k over a compressed cache
     timeline: bool = False
+    shuffled: bool = False  # wo_b in aiter's (16, 16) preshuffle (wo_a stays row-major)
 
 
 def plus(t0, v):
@@ -191,10 +181,11 @@ def _fp8_pair_f32(word, scale, hi):
 @flyc.jit
 def stage_split(c, unit):
     """Flash-decoding over chunk ``unit % nchunk`` of token ``unit // nchunk``,
-    every head of the rank -> the chunk's partial and (max, sum) per head. Wave
-    (head group hg, key tile kt): keys 16 kt .. of the chunk (loaded and
-    dequantized once) against the group's head tiles; then dims 64 w .. of the
-    PV over every key and head."""
+    every head of the rank -> the chunk's partial and (max, sum) per head.
+
+    Wave (head group hg, key tile kt) takes keys 16 kt .. of the chunk, loaded and
+    dequantized once, against the group's head tiles; then wave w takes dims
+    64 w .. of the PV over every key and head."""
     tid, lane, wave, d, s = c["tid"], c["lane"], c["wave"], c["d"], c["S"]
     a, sl = c["args"], c["sl"]
     nchunk = c["nchunk"]
@@ -227,14 +218,12 @@ def stage_split(c, unit):
     if const_expr("krdy" in c):
         # an index source's table: this launch builds it after the indexer ran
         await_flags(c, c["krdy"], 1, lambda u: t)
-    # the key count and this lane's key: independent loads, out together
-    # (the key table holds -1 past a token's keys)
+    # kv_len and this lane's key load together: the table holds -1 past a token's keys
     kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("krdy" in c) else 0)
     key = k0 + kt * 16 + r16
     data, sc, okv = key_rec(c, t, key)
     if k0 < kv_len:
-        # a key's 448 e4m3 as 7 x 16 B (lane g: dims 64 c + 16 g ..), its 64
-        # bf16 rope dims as 2 x 16 B (32 c + 8 g ..), its 7 scale bytes
+        # lane g's 16 B slices: e4m3 dims 64 c + 16 g .., bf16 rope dims 32 c + 8 g ..
         scw = global_load(sc, words=2)
         nope = [
             global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
@@ -244,7 +233,6 @@ def stage_split(c, unit):
             global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
             for cc in range(ROPE // 32)
         ]
-        # q of every head into LDS (bf16 rows of 512 + pad), 16 B a thread
         for i in range_constexpr(cdiv(qrow, THREADS)):
             u = fresh(tid) + THREADS * i
             if u < qrow:
@@ -254,7 +242,7 @@ def stage_split(c, unit):
                     + (u // (HEAD_DIM // 8)) * Q_ROW
                     + (u % (HEAD_DIM // 8)) * 4,
                 )
-        # the raw rows to LDS for the PV (head group 0's waves)
+        # the raw rows to LDS for the PV: every head group loaded the same keys, group 0 stores
         if hgi == 0:
             rawb = sl["raw"] + (kt * 16 + r16) * (REC // 4)
             for c4 in range_constexpr(NOPE // 64):
@@ -265,9 +253,7 @@ def stage_split(c, unit):
                 fx.ptr_store(scw, rawb + DATA // 4)
         gpu.barrier()
         stamp(c, 5)
-        # QK: A = the keys (dequantized once), B = q of a head tile (LDS); the
-        # contraction's 32-dim chunk 2 c + h of the nope dims is {64 c + 16 g +
-        # 8 h ..} (lane g's 16 B load), q read in the same order
+        # QK: MFMA K chunk 2 c + h is nope dims 64 c + 16 g + 8 h .., q read in the same order
         scale = a["qk_scale"].bitcast(fx.Float32)
         st = sl["st"]
         accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nht)]
@@ -330,7 +316,6 @@ def stage_split(c, unit):
             if g == 0:
                 fx.ptr_store(lw, lst + (hti * nkt + kt) * HEAD_TILE + r16)
         gpu.barrier()
-        # chunk stats: (max, sum) per head
         if tid < d.heads:
             hts = tid // HEAD_TILE
             hr = tid % HEAD_TILE
@@ -345,9 +330,7 @@ def stage_split(c, unit):
                 ((t * nchunk + ch) * d.heads + tid) * 2,
                 cache_modifier=CM_DEV,
             )
-        # PV: wave w dims 64 w + 4 r16 + dt (dt = 0..3: one LDS word holds the
-        # four of a key); the rope wave (dims 448..) reads bf16 pairs. Lane
-        # (r16, g) takes keys 4 g + j of a 16-key tile: A[dim][key]
+        # PV: wave w dims 64 w + 4 r16 + dt (an LDS word holds a key's four), lane g keys 4 g + j
         is_rope = wave == WAVES - 1
         dbase = 64 * wave
         sh = (wave % 4) * 8
@@ -403,9 +386,7 @@ def stage_split(c, unit):
                         )
                     )
         stamp(c, 6)
-        # partial[t][ch][head][dim] bf16: lane (r16, g) holds C rows 4 g + i ->
-        # dims 64 w + 16 g + 4 i + dt of head ht2 * 16 + r16: 32 contiguous
-        # bytes, two 16 B stores (4 lanes fill a 128 B line)
+        # partial[t][ch][head][dim] bf16: lane (r16, g) owns 32 contiguous B, dims 64 w + 16 g ..
         for ht2 in range_constexpr(d.head_tiles):
             hh = ht2 * HEAD_TILE + r16
             words = []
@@ -447,7 +428,7 @@ def stage_combine(c, unit):
     ck = chunk_keys(d, s)
     pos = ld_i32(a["pos"], 2 * t)
     sink = ld_f32(a["sink"], h) * fx.Float32(LOG2E)
-    d0 = lane * 8  # this lane's 8 dims
+    d0 = lane * 8
     rope_lane = d0 >= NOPE
     jj = fx.max((d0 - NOPE) // 2, 0)  # 4 pairs from here
     cs = [
@@ -569,7 +550,15 @@ def stage_woa(c, task, acc, t0, n):
 
 def wob_loads(c, task, pred=None):
     a = c["args"]
-    return gemv_loads(c, a["wob"], a["wob_s"], c["d"].o_rows, task * ROWS, pred=pred)
+    return gemv_loads(
+        c,
+        a["wob"],
+        a["wob_s"],
+        c["d"].o_rows,
+        task * ROWS,
+        pred=pred,
+        shuffled=c["shuffled"],
+    )
 
 
 def _wob_store(a, t, col, v0, v1):
@@ -612,6 +601,16 @@ def stage_wob(c, task, ops, task2, ops2, has2, t0, n, mark=False):
 # ---------------------------------------------------------------- kernel
 
 
+def woa_units(s: int, d: Dims) -> int:
+    """wo_a's units: past one token tile, a (task, tile) each where they fit the
+    CTAs, else a task each.
+
+    ROCm/ATOM's tile tasks: a task's tiles in series on one CTA would leave most
+    CTAs idle through wo_a, and a tile's reread of its task's weights hits L2."""
+    nt = len(token_tiles(s))
+    return d.woa_tasks * nt if nt > 1 and d.woa_tasks * nt <= BLOCKS else d.woa_tasks
+
+
 def back_plan(key):
     """(nchunk, n_split, n_comb, COMB0, WOA0, WOB0, early_wob) of a build."""
     s, d = key.tokens, Dims(key.tp)
@@ -622,14 +621,11 @@ def back_plan(key):
     COMB0 = n_split % BLOCKS
     assert d.woa_tasks <= BLOCKS
     assert BLOCKS < d.wob_tasks <= 2 * BLOCKS
-    # the GEMVs past the attention units, so CTAs without attention work have
-    # their weights in flight from the start
+    # GEMV units past the attention units, so CTAs without attention load weights first
     WOA0 = (n_split + n_comb) % BLOCKS
-    WOB0 = (WOA0 + d.woa_tasks) % BLOCKS
-    # wo_b's weights before the wo_a stage only while the wo_a CTAs have no
-    # attention work (loads complete in issue order: else they would hold up
-    # wo_a's activation rows)
-    early_wob = n_split + n_comb + d.woa_tasks <= BLOCKS
+    WOB0 = (WOA0 + woa_units(s, d)) % BLOCKS
+    # loads complete in issue order, so wo_b's weights go early only if wo_a CTAs do no attention
+    early_wob = n_split + n_comb + woa_units(s, d) <= BLOCKS
     return nchunk, n_split, n_comb, COMB0, WOA0, WOB0, early_wob
 
 
@@ -689,6 +685,7 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
         "xsl": gml.xsl.ptr,
         "d": d,
         "ratio": key.ratio,
+        "shuffled": key.shuffled,
         "mb": Mailbox(tag),
         "nchunk": back_plan(key)[0],
         "sl": {"q": spl.q.ptr, "raw": spl.raw.ptr, "p": spl.p.ptr, "st": spl.st.ptr},
@@ -718,67 +715,91 @@ def run_back(c, key, bid):
         stage_combine(c, unit)
     gpu.barrier()
     stamp(c, 2)
-    # the GEMV weights, every CTA right after its attention work: its wo_a
-    # task (if any), then its one or two wo_b tasks
-    woa_task = first_task(bid, WOA0)
-    has_woa = woa_task < woa_tasks
-    woa_t = fx.min(woa_task, woa_tasks - 1)
+    # the GEMV weights right after the attention work: the wo_a unit's (if any), then wo_b's
+    nt = len(tiles)
+    units = woa_units(s, dd)
+    woa_spread = units > woa_tasks
+    woa_unit = first_task(bid, WOA0)
+    has_woa = woa_unit < units
+    woa_t = fx.min(woa_unit % woa_tasks, woa_tasks - 1)
     ops = bf16_gemv_loads(
         c, a["woa"], a["woa_s"], group_k, woa_t * WOA_ROWS, WOA_SPLIT_K, pred=has_woa
     )
-    wob_task = first_task(bid, WOB0)
-    wob_second = wob_task + BLOCKS
-    has_second = wob_second < wob_tasks
+    wob_unit = first_task(bid, WOB0)
+    if const_expr(nt == 1):
+        # one or two wo_b tasks a CTA, every one on the step's rows
+        wob_tile = 0
+        wob_ts = [wob_unit, wob_unit + BLOCKS]
+    else:
+        # a tile a CTA (ROCm/ATOM's tile tasks): rows read once, every task's weights in flight
+        wob_tile = wob_unit % nt
+        per_tile = (BLOCKS - wob_tile + nt - 1) // nt
+        most = -(-wob_tasks // (BLOCKS // nt))
+        wob_ts = [wob_unit // nt + k * per_tile for k in range(most)]
 
     def wob_weights():
-        return (
-            wob_loads(c, wob_task),
-            wob_loads(c, fx.min(wob_second, wob_tasks - 1), pred=has_second),
-        )
+        # one tile: the first task is every CTA's (BLOCKS < wob_tasks), unmasked
+        return [
+            wob_loads(c, t)
+            if nt == 1 and k == 0
+            else wob_loads(c, fx.min(t, wob_tasks - 1), pred=t < wob_tasks)
+            for k, t in enumerate(wob_ts)
+        ]
 
     if const_expr(early_wob):
-        ops1, ops2 = wob_weights()
+        wops = wob_weights()
     if const_expr(c.get("tl") is not None):
         rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
     stamp(c, 8)
-    # wo_a: every token tile of its group's XO rows, the next tile's in flight
-    if has_woa:
+    half_w = group_k // 4
+
+    def woa_tile(ti, n_tokens):
+        # wo_a on token tile ``ti`` (its first ``n_tokens`` rows' flags awaited)
+        t0, n = tiles[ti]
         grp = woa_t // (woa_tasks // groups)
-        await_flags(c, c["crdy"], s, lambda u: u * (heads // COMB_HEADS) + grp)
+        await_flags(
+            c,
+            c["crdy"],
+            n_tokens,
+            lambda u: (t0 + u) * (heads // COMB_HEADS) + grp,
+        )
         stamp(c, 9)
-        # the group's bf16 XO rows, a K half at a time (a half row: group_k // 4
-        # words), the next half's in flight
-        half_w = group_k // 4
-        passes = [(ti, h) for ti in range(len(tiles)) for h in range(2)]
-
-        def xo_loads(pi):
-            ti, h = passes[pi]
-            off = (grp * group_k + h * group_k // 2) // 2
-            return words_loads(c, c["xo"], q_rows // 2, off, half_w, *tiles[ti])
-
-        regs = xo_loads(0)
-        acc = None
-        for pi in range_constexpr(len(passes)):
-            ti, h = passes[pi]
-            t0, n = tiles[ti]
+        # the group's XO rows a K half at a time, the next half's loads in flight
+        off = [(grp * group_k + h * group_k // 2) // 2 for h in range(2)]
+        regs = words_loads(c, c["xo"], q_rows // 2, off[0], half_w, t0, n)
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        for h in range_constexpr(2):
             words_store(c, regs, half_w, c["xl"], n)
-            if const_expr(pi + 1 < len(passes)):
-                regs = xo_loads(pi + 1)
             if const_expr(h == 0):
-                acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                regs = words_loads(c, c["xo"], q_rows // 2, off[1], half_w, t0, n)
             acc = bf16_gemv_mfmas(c, group_k, c["xl"], ops, acc, h, n)
-            gpu.barrier()  # the next pass's rows overwrite the LDS
-            if const_expr(h == 1):
-                stage_woa(c, woa_t, acc, t0, n)
-        stamp(c, 10)
-        publish(c, c["ardy"], woa_t)
+            gpu.barrier()  # the next half's rows overwrite the LDS
+        stage_woa(c, woa_t, acc, t0, n)
+
+    if has_woa:
+        if const_expr(woa_spread):
+            # this unit's tile of its task
+            for ti in range_constexpr(nt):
+                if woa_unit // woa_tasks == ti:
+                    woa_tile(ti, tiles[ti][1])
+            stamp(c, 10)
+            publish(c, c["ardy"], woa_unit)
+        else:
+            # every token tile in turn, the first waiting on every row's flags
+            for ti in range_constexpr(nt):
+                woa_tile(ti, s if ti == 0 else 0)
+            stamp(c, 10)
+            publish(c, c["ardy"], woa_t)
     stamp(c, 3)
-    # wo_b
     if const_expr(not early_wob):
-        ops1, ops2 = wob_weights()
+        wops = wob_weights()
     stamp(c, 11)
-    await_flags(c, c["ardy"], woa_tasks, lambda u: u)
+    if const_expr(woa_spread):
+        # this tile's wo_a units
+        await_flags(c, c["ardy"], woa_tasks, lambda u: wob_tile * woa_tasks + u)
+    else:
+        await_flags(c, c["ardy"], woa_tasks, lambda u: u)
     stamp(c, 12)
     x8b = (
         c["x8b"],
@@ -790,25 +811,42 @@ def run_back(c, key, bid):
         0,
         o_rows // 32,
     )
-    regs = rows_loads(c, *x8b, *tiles[0])
-    for ti in range_constexpr(len(tiles)):
+
+    def wob_tile_run(ti):
+        # every wo_b task of this CTA on token tile ``ti``, two at a time
         t0, n = tiles[ti]
-        rows_store(c, regs, o_rows // 4, o_rows // 32, c["xl"], c["xsl"], n)
-        if const_expr(ti == 0):
-            stamp(c, 14)
-        if const_expr(ti + 1 < len(tiles)):
-            regs = rows_loads(c, *x8b, *tiles[ti + 1])
-        stage_wob(
+        rows_store(
             c,
-            wob_task,
-            ops1,
-            fx.min(wob_second, wob_tasks - 1),
-            ops2,
-            has_second,
-            t0,
+            rows_loads(c, *x8b, t0, n),
+            o_rows // 4,
+            o_rows // 32,
+            c["xl"],
+            c["xsl"],
             n,
-            mark=ti == 0,
         )
-        if const_expr(ti == 0):
-            stamp(c, 13)
+        stamp(c, 14)
+        for k in range_constexpr(0, len(wob_ts), 2):
+            k2 = min(k + 1, len(wob_ts) - 1)
+            # an odd last task runs alone: its pair is itself, masked off
+            has2 = wob_ts[k2] < (wob_tasks if k2 > k else 0)
+            run = (
+                c,
+                wob_ts[k],
+                wops[k],
+                fx.min(wob_ts[k2], wob_tasks - 1),
+                wops[k2],
+                has2,
+                t0,
+                n,
+            )
+            if const_expr(nt == 1 and k == 0):
+                stage_wob(*run, mark=True)
+            else:
+                if wob_ts[k] < wob_tasks:
+                    stage_wob(*run, mark=k == 0)
+        stamp(c, 13)
+
+    for ti in range_constexpr(nt):
+        if wob_tile == ti:
+            wob_tile_run(ti)
     stamp(c, 4)

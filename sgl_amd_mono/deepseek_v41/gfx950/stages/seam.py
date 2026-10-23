@@ -54,7 +54,7 @@ POST_MULT = 2.0
 LOG2E = 1.0 / math.log(2.0)
 
 COLS = 32  # hidden columns a slice task
-SLICES = HIDDEN // COLS  # 160
+SLICES = HIDDEN // COLS
 KT = HC * COLS  # projection columns a slice task
 PART = MIX + 1  # a slice's partials a token: the mixes, then the sum of squares
 GATE_BLOCK = 8  # slices a gate thread sums
@@ -93,21 +93,36 @@ def pend_value(c, t, col, cc):
 # ---------------------------------------------------------------- slice
 @flyc.jit
 def slice_input(c, task, idx):
-    """Return thread ``idx``'s pair of the layer input."""
+    """Write thread ``idx``'s pair of the layer input to LIN; with ``aux_on``, also store
+    the pair's mean over the R_new streams, as DSpark captures a target layer."""
     s, rl = c["S"], c["rl"]
     a = c["args"]
+    # read before the dynamic branch: a method call on c inside one carries c
+    aux_on = c.get("aux_on")
     c0 = task * COLS
     if idx < s * COLS // 2:
         t = idx // (COLS // 2)
         cc = 2 * (idx % (COLS // 2))
-        outs = []
+        outs, means = [], []
         for d in range_constexpr(2):
             acc = fx.Float32(0.0)
+            total = fx.Float32(0.0)
             for h in range_constexpr(HC):
                 rb = fx.ptr_load(rl + (t * KT + h * COLS + cc + d))
                 acc = acc + ld_f32(a["pre_in"], t * HC + h) * rb
+                # torch's mean over the streams: summed in order, then times 1/HC
+                total = rb if h == 0 else total + rb
             outs.append(acc)
+            means.append(total * fx.Float32(1.0 / HC))
         c["put_bf"](c["lin"], t * HIDDEN + c0 + cc, outs)
+        if const_expr(aux_on is not None):
+            if aux_on:
+                for k in range_constexpr(2):
+                    bo.buffer_store(
+                        means[k].to(fx.BFloat16),
+                        rsrc(a["aux_out"]),
+                        t * HIDDEN + c0 + cc + k,
+                    )
 
 
 def slice_at(c0, e):
@@ -131,8 +146,7 @@ def slice_row(c, c0, e, got):
     a = c["args"]
     t, o, col = slice_at(c0, e)
     if const_expr(not c.get("fold", True)):
-        # a settled residual, no post owed (the first layer, after an Engram write):
-        # stream o as it arrives, as SGLang's boundary without x
+        # no post owed (first layer, after Engram): stream o as is, as SGLang's x-less boundary
         v = got[0]
     else:
         r, cm, post = got
@@ -240,8 +254,7 @@ def slice_mix(c, task, t0, n):
 
 
 # ---------------------------------------------------------------- gate
-# comb[r][c] sits on lane COMB0 + 4 r + c: a row is 4 lanes of one DPP row, so its
-# sums are xor butterflies, (e0 + e1) + (e2 + e3) on every lane (ROCm/ATOM)
+# comb[r][c] on lane COMB0 + 4 r + c, one DPP row: xor-butterfly sums, (e0 + e1) + (e2 + e3)
 COMB0 = 16
 
 
@@ -259,11 +272,11 @@ def _row_max(v):
 
 @flyc.jit
 def stage_gate(c, t):
-    """Token t's 160 slices, in slice order, -> post / comb / next pre."""
+    """Token t's slices, in slice order, -> post / comb / next pre."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     red = c["red"]
     a = c["args"]
-    groups = SLICES // GATE_BLOCK  # 20
+    groups = SLICES // GATE_BLOCK
     if tid < groups * PART:
         g = tid // PART
         j = tid % PART

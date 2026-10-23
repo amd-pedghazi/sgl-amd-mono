@@ -4,9 +4,9 @@
 
 **SGLang-AMD-Mono** is the monokernel library of the [SGLang](https://github.com/sgl-project/sglang) framework for AMD Instinct GPUs. A monokernel is a persistent kernel that runs most of a decoder layer, including its attention, its mixture-of-experts block and both tensor-parallel all-reduces, in one or two launches. This removes the launch gaps and collective latency that dominate small-batch decoding.
 
-The library implements SGLang's monokernel interface ([RFC #43949](https://github.com/sgl-project/sglang/issues/43949)) and loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point), which registers each model's spec under the monokernel backend `amd`. With `--monokernel-backend amd`, every decode and speculative-verify step that a spec serves runs on its kernels, and every other step runs SGLang's standard path.
+The library implements SGLang's monokernel interface ([RFC #43949](https://github.com/sgl-project/sglang/issues/43949)) and loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point), which registers each model's spec under the monokernel backend `amd`. With `--enable-amd-monokernel` (`--monokernel-backend amd` before [sgl-project/sglang#45389](https://github.com/sgl-project/sglang/pull/45389)), every decode and speculative-verify step that a spec serves runs on its kernels, and every other step runs SGLang's standard path.
 
-> **Experimental:** `--monokernel-backend` is an experimental SGLang feature. The kernels, the models and setups they cover, and the plugin interface may change.
+> **Experimental:** `--enable-amd-monokernel` is an experimental SGLang feature. The kernels, the models and setups they cover, and the plugin interface may change.
 
 ## Features
 
@@ -16,7 +16,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
-| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode steps of up to 8 rows (4 at TP4) |
+| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 
 ### Design
@@ -30,10 +30,10 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 
 ### Requirements
 
-- SGLang with the monokernel interface (`sglang.srt.monokernels`, in review as [sgl-project/sglang#44353](https://github.com/sgl-project/sglang/pull/44353))
+- SGLang with the monokernel interface (`sglang.kernels.plugin_kernels.amd` and `sglang.srt.kernel_plugins.amd`; `sglang.srt.monokernels` before [sgl-project/sglang#45389](https://github.com/sgl-project/sglang/pull/45389))
 - ROCm with FlyDSL and AITER, as included in SGLang's ROCm images
 - AMD Instinct MI350X or MI355X
-- MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--monokernel-backend amd` refuses MiniMax-M3 and names them.
+- MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
 
 ### Installation
 
@@ -59,6 +59,22 @@ SGLANG_USE_AITER=1 AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
 On gfx950 the decode graph capture fails in AITER's MoE without
 `AITER_BF16_FP8_MOE_BOUND=0`. The flags are those of the serving tests
 (`test/e2e/deepseek_v41_server.py`).
+
+GLM-5.3, with MTP (its NextN layer drafts one chain; a verify step of 4 rows a
+request runs the kernels at batch sizes 1 and 2 at TP8):
+
+```bash
+SGLANG_USE_AITER=1 python -m sglang.launch_server \
+  --model-path zai-org/GLM-5.3 \
+  --tp 8 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --monokernel-backend amd
+```
 
 MiniMax-M3, with an EAGLE3 draft:
 
@@ -98,10 +114,12 @@ sgl-amd-mono/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │   │   └── gfx950/      # kernels and launch runner
-│   └── minimax_m3/
-│       ├── spec.py      # spec and forward
-│       ├── weights.py   # the layer views the kernels read
-│       └── gfx950/      # kernels and launch runner
+│   ├── minimax_m3/
+│   │   ├── spec.py      # spec and forward
+│   │   ├── weights.py   # the layer views the kernels read
+│   │   └── gfx950/      # kernels and launch runner
+│   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
+│   └── qwen38_flash_next/   # Qwen3.8-Flash-Next; spec and kernels land in its PR
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
     ├── kernels/         # GPU: each launch against SGLang's reference ops

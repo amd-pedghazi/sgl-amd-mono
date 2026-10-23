@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Vendored from ROCm/ATOM @ 454d0e3023: atom/mono/device/select.py
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A CTA's exact top-k for a small k, by counting: entry e of an LDS array is a
-signed 64-bit sort key (a 32-bit key high, the entry's id low: key, then id,
-descending), and an entry's rank is the count of entries that beat it -- no
-order of arrival enters, so every CTA and rank agrees.
+"""A CTA's exact top-k for a small k, by counting.
 
-Counting every entry against every other is VALU-bound (one 64-bit compare an
-entry pair). Past a few hundred entries, ``group_floor`` and ``compact`` first
-narrow the field to the entries that can still be among the top k, and only
-those are counted against each other.
+Entry e of an LDS array is a signed 64-bit sort key (a 32-bit key high, the entry's id
+low: key, then id, descending), and an entry's rank is the count of entries that beat
+it, so no order of arrival enters and every CTA and rank agrees. Counting every entry
+against every other is VALU-bound (one 64-bit compare an entry pair), so past a few
+hundred entries ``group_floor`` and ``compact`` first narrow the field to the entries
+that can still be among the top k, and only those are counted against each other.
 """
 
 import flydsl.compiler as flyc
@@ -33,12 +32,13 @@ def put_key(keys, e, key, idx, live):
 
 @flyc.jit
 def count_beaten(keys, mines, m):
-    """For each of up to two 64-bit sort keys ``mines``, how many of the first
-    m entries of ``keys`` beat it. Entries up to m rounded up to BATCH must
-    hold ``put_key``'s (a dead one beats nothing). Every lane reads the same
-    entry (an LDS broadcast), BATCH a round so the reads overlap, and a
-    compare is one instruction; the counts share one register, 16 bits each,
-    so the dynamic loop carries one value."""
+    """For each of up to two 64-bit sort keys ``mines``, how many of the first m
+    entries of ``keys`` beat it.
+
+    Entries up to m rounded up to BATCH must hold ``put_key``'s (a dead one beats
+    nothing). Every lane reads the same entry (an LDS broadcast), BATCH a round so the
+    reads overlap, and a compare is one instruction; the counts share one register,
+    16 bits each, so the dynamic loop carries one value."""
     assert len(mines) <= 2, "two 16-bit counts a register"
     v4i = fx.Vector.make_type(4, fx.Int32)
     packed = fx.Int32(0)
@@ -58,14 +58,14 @@ def count_beaten(keys, mines, m):
 
 @flyc.jit
 def group_floor(keys32, k, red, lane, wave):
-    """A lower bound of the k-th largest of the CTA's 32-bit keys (each
-    thread's ``keys32``, dead ones ``KEY_LEAST``): k disjoint groups -- the
-    entries of the lanes with one ``lane % k`` -- each group's largest key, the
-    least of those; k distinct entries are at least it. Live entries packed
-    from entry 0 (k of them at least) leave no group empty: a group of
-    contiguous lanes would hold only dead ones past the live, and its least key
-    makes the floor no floor. ``red``: WAVES * k + 1 words of LDS. Barriers
-    included."""
+    """A lower bound of the k-th largest of the CTA's 32-bit keys (each thread's
+    ``keys32``, dead ones ``KEY_LEAST``), barriers included.
+
+    The least of k disjoint groups' largest keys, a group being the lanes of one
+    ``lane % k``: k distinct entries are at least it. Live entries packed from entry 0
+    (k of them at least) leave no group empty, where a group of contiguous lanes would
+    hold only dead ones past the live and make the floor no floor. ``red``:
+    WAVES * k + 1 words of LDS."""
     assert k in (1, 2, 4, 8, 16, 32, 64), k
     top = keys32[0]
     for v in keys32[1:]:
@@ -87,12 +87,13 @@ def group_floor(keys32, k, red, lane, wave):
 
 @flyc.jit
 def compact(cand, counter, cap, entries, floor):
-    """The entries of ``entries`` ((key32, id, live) a thread) that can be in
-    the top k -- live, key at least ``floor`` (ties kept: a superset) -- to
-    ``cand`` as ``put_key`` entries, an LDS slot each from ``counter`` (zeroed,
-    and ``cand`` filled with dead entries, before the barrier ``group_floor``
-    holds). Slots past ``cap`` are dropped; the caller reads the count after a
-    barrier and counts every entry instead when it is past ``cap``."""
+    """The entries of ``entries`` ((key32, id, live) a thread) that can be in the top
+    k -- live, key at least ``floor``, ties kept -- to ``cand`` as ``put_key`` entries.
+
+    Each takes an LDS slot from ``counter``; ``counter`` must be zeroed, and ``cand``
+    filled with dead entries, before the barrier ``group_floor`` holds. Slots past
+    ``cap`` are dropped; the caller reads the count after a barrier and counts every
+    entry instead when it is past ``cap``."""
     for key, idx, live in entries:
         if live & (key >= floor):
             slot = fx.llvm.atomic_add(counter, fx.Int32(1), syncscope="workgroup")

@@ -1,11 +1,9 @@
-"""K2i, the index sources' FP4 scorer (RFC #43949), on one gfx950 GPU against
-SGLang's indexer ops, on synthetic FP4 index planes in SGLang's layout: the device
-walk plan against the host plan; the logits against SGLang's aiter FP4 logits (the
-spec's ``k2i.logits.rel``) and an fp64 reference; a candidate consumer's selection
-from its candidate columns against SGLang's top-k within the candidate blocks of
-the same logits (the spec's ``k2i.sel.max_abs``: the same sets); the FULL ->
-candidate producer -> REINDEX pipeline against SGLang's (per-row overlap, since
-the logits differ in rounding); and a graph replay against eager runs.
+"""K2i, the index sources' FP4 scorer (RFC #43949), against SGLang's indexer ops on one gfx950.
+
+On synthetic FP4 planes in SGLang's layout: the device walk plan against the host plan, the
+logits against SGLang's and fp64, a candidate consumer's selection against SGLang's top-k within
+the same candidate blocks, the two-level pipeline against SGLang's by per-row overlap, and a
+graph replay against eager runs.
 
 Adapted from sgl-project/sglang#43984's test_dsv41_k2a_indexer.py."""
 
@@ -27,8 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 BOUND_MAX = 1 << 19  # every case's longest context
 PER_REQ = 6  # DSpark verify: 6 rows a request
-# the selections against SGLang's pipeline: per-row Jaccard (the logits differ in
-# rounding, so a near-tie at the 512th row can flip)
+# per-row Jaccard against SGLang's pipeline: rounding can flip a near-tie at the 512th row
 JACCARD_MEDIAN, JACCARD_P1 = 1.0, 0.99
 
 _RUNNER = []
@@ -46,8 +43,7 @@ def _k2i():
 
 
 def _walk_case(*, rng, n):
-    """A step's rows: requests of ``per`` rows (1 decode, 6 verify, or ragged runs)
-    with bounds around a context."""
+    """A step's rows: requests of 1 (decode), 6 (verify) or ragged rows, bounds around a context."""
     kind = rng.integers(3)
     sizes = []
     while sum(sizes) < n:
@@ -272,8 +268,7 @@ def _jaccard(*, got, want):
     "ctxs", [[8192], [300, 8192], [131072], [524288]], ids=["8k", "mix", "128k", "512k"]
 )
 def test_logits(ctxs):
-    """FULL: K2i's logits of every row it scores (past 512 columns) against
-    SGLang's (the spec's bound) and fp64."""
+    """K2i's FULL logits of every scored row stay within ``k2i.logits.rel`` of SGLang's and fp64."""
     k2i = _k2i()
     case = fp4_case(ctxs=ctxs, seed=len(ctxs) + max(ctxs))
     k2i.walk_plan(
@@ -303,10 +298,8 @@ def test_logits(ctxs):
 
 @pytest.mark.parametrize("ctxs", [[20000, 9000], [131072]], ids=["20k9k", "128k"])
 def test_reindex_selects_sglangs_rows_within_the_candidates(ctxs):
-    """REINDEX: from its candidate columns alone (the newest block moved last,
-    scored through the candidate table, SGLang's top-k, our map back to positions
-    and slots), a consumer selects the rows SGLang's top-k within the candidate
-    blocks selects of the same layer's full logits (the spec's ``k2i.sel.max_abs``)."""
+    """A REINDEX consumer, scoring its candidate columns alone, selects the rows SGLang's top-k
+    within the candidate blocks selects from the same layer's full logits."""
     k2i = _k2i()
     case = fp4_case(ctxs=ctxs, seed=21 + max(ctxs))
     rows = case["q"].shape[0]
@@ -326,9 +319,8 @@ def test_reindex_selects_sglangs_rows_within_the_candidates(ctxs):
     "ctxs", [[8192, 20000], [131072], [300, 524288]], ids=["8k20k", "128k", "512k"]
 )
 def test_pipeline_against_sglang(ctxs):
-    """A two-level step against SGLang's whole pipeline (its own logits): the
-    candidate producer's rows and blocks, then a consumer's rows inside the
-    blocks, overlap per row."""
+    """A two-level step's producer rows, candidate blocks and consumer rows overlap SGLang's
+    whole pipeline (on its own logits) per row."""
     k2i = _k2i()
     case = fp4_case(ctxs=ctxs, seed=11 + max(ctxs))
     raw, _, cands = run_k2i(k2i=k2i, case=case, kind="producer")
@@ -350,10 +342,9 @@ def test_pipeline_against_sglang(ctxs):
 
 
 def test_graph_replay_selects_as_eager():
-    """The three kinds with the walk plan, captured once and replayed on other
-    contexts and tables: every selection is an eager run's of the same inputs, as
-    sets (SGLang's top-k leaves a row's order to its atomics: two eager runs
-    differ in order too)."""
+    """A captured step of the three kinds, replayed on other contexts and tables, selects as eager.
+
+    Compared as sets: SGLang's top-k leaves a row's order to its atomics; eager runs differ too."""
     k2i = _k2i()
     ppr = _cdiv(40000, 64)
     static = fp4_case(ctxs=[20000, 9000], seed=3, pages_per_req=ppr)

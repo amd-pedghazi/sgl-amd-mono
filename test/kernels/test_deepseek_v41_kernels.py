@@ -1,9 +1,8 @@
-"""The DeepSeek-V4.1 gfx950 monokernels against SGLang's ops (RFC #43949), each
-check under torchrun at TP2 and TP4 (``deepseek_v41/check_*.py``): K1's seam
-mixes, SWA KV records and query; K2's attention core, wo_a and wo_b stages; the
-FFN launch's seam, norm and MoE, on the target's route and the DSpark draft's;
-each output against the spec's bound, then a bitwise graph replay across widths
-with every rank agreeing."""
+"""The DeepSeek-V4.1 gfx950 monokernels against SGLang's ops (RFC #43949).
+
+Runs each ``deepseek_v41/check_*.py`` (K1, K2, and the FFN launch on the target's and the DSpark
+draft's routes) under torchrun at TP2 and TP4: every output within the spec's bound, then a
+bitwise graph replay across widths with every rank agreeing."""
 
 import subprocess
 import sys
@@ -45,14 +44,19 @@ class TestMonoDeepseekV41Kernels(CustomTestCase):
         self._check("check_ffn", "--replays", "200")
 
     def test_ffn_launch_draft_route(self):
-        # the DSpark draft's MoE: 128 experts, top-3, a FP4 group an ug task
         self._check("check_ffn", "--replays", "100", "--draft")
 
     def test_k1(self):
         self._check("check_k1", "--trials", "2")
 
+    def test_k1_preshuffled(self):
+        self._check("check_k1", "--trials", "2", "--shuffled")
+
     def test_k2(self):
         self._check("check_k2", "--replays", "100")
+
+    def test_k2_preshuffled(self):
+        self._check("check_k2", "--replays", "100", "--shuffled")
 
 
 if __name__ == "__main__":

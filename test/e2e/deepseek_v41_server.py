@@ -11,6 +11,7 @@ ENV = {
     "SGLANG_USE_ROCM700A": "0",
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
+# no --monokernel-backend, so a test can launch the normal path too
 COMMON = [
     "--trust-remote-code",
     "--tp",
@@ -22,8 +23,7 @@ COMMON = [
     "--mem-fraction-static",
     "0.7",
 ]
-# Without --monokernel-backend, so a test can launch the normal path too.
-# DSpark: verify steps of 6 rows a request, 8 requests at the largest width (48 rows)
+# DSpark verify steps: 6 rows a request, 8 requests at the largest width (48 rows)
 ARGS = COMMON + [
     "--speculative-algorithm",
     "DSPARK",

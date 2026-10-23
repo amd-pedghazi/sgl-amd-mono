@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A timeline build's stage marks (debug only): thread 0 of each CTA stores the
-100 MHz clock at mark k into its CTA's row of a [CTA][TL_POINTS] int64 scratch
-region; a build without the region records nothing. Adapted from ROCm/ATOM
-(atom/mono/device/stamps.py), which keeps the row in LDS until the launch ends;
-here each mark is a global store, a small skew on the waits that follow it."""
+"""A timeline build's stage marks (debug only).
+
+Thread 0 of each CTA stores the 100 MHz clock at mark k into its CTA's row of a
+[CTA][TL_POINTS] int64 scratch region; a build without the region records nothing.
+Adapted from ROCm/ATOM (atom/mono/device/stamps.py), which keeps the row in LDS
+until the launch ends: here each mark is a global store, a small skew on the waits
+after it."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx

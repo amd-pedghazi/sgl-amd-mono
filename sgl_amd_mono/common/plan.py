@@ -95,8 +95,7 @@ def padded(n: int, align: int) -> int:
 
 # ---------------------------------------------------------------- build keys
 _SCALARS = (int, float, bool, str, enum.Enum, type(None))
-# FlyDSL keys a kernel on its own directory's plain helpers only, so the plugin and
-# aiter FlyDSL modules a kernel imports are hashed into its key
+# FlyDSL keys a kernel only on its own directory's helpers, so its imports are hashed in
 _TRACED = ("sgl_amd_mono", "aiter.ops.flydsl.kernels")
 _DOCUMENTED = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
@@ -151,11 +150,13 @@ def _module_code(name: str):
 
 @functools.cache
 def kernel_sources(module: str) -> str:
-    """The digest of the code a kernel built in ``module`` traces: ``module`` and every
-    plugin and aiter FlyDSL module it imports, transitively, without comments or
-    docstrings (FlyDSL hashes each jit and kernel function's own source itself).
-    Take it at import, as ``SOURCES = kernel_sources(__name__)``: a digest read at
-    build time would pair an edit made since import with the code already loaded."""
+    """The digest of the code a kernel built in ``module`` traces.
+
+    ``module`` and every plugin and aiter FlyDSL module it imports, transitively,
+    without comments or docstrings (FlyDSL hashes each jit and kernel function's own
+    source itself). Take it at import, as ``SOURCES = kernel_sources(__name__)``: a
+    digest read at build time would pair an edit made since import with the code
+    already loaded."""
     codes, todo = {}, [module]
     while todo:
         name = todo.pop()
@@ -191,9 +192,10 @@ def _key_pairs(prefix: str, items):
 
 
 def key_tuple(key, sources: str) -> tuple:
-    """Return the (name, value) pair of every build parameter in ``key``, a nested
-    Struct's or dataclass's fields flattened, then ("sources", ``sources``). ``key``
-    is a build Struct, or a builder's ``locals()`` before its first assignment; FlyDSL
+    """Every build parameter in ``key`` as a (name, value) pair, then ("sources", ``sources``).
+
+    ``key`` is a build Struct, or a builder's ``locals()`` before its first
+    assignment; a nested Struct's or dataclass's fields are flattened, as FlyDSL
     leaves Structs, dataclasses and dicts a kernel closes over out of its key."""
     items = key.items() if isinstance(key, dict) else _fields(key)
     return (*_key_pairs("", items), ("sources", sources))

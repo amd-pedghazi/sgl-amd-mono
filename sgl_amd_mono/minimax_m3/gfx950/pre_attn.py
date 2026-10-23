@@ -2,9 +2,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """K1: one MiniMax-M3 sparse layer, input norm through cache insert.
 
-Traced into the fused layer kernel (``post_attn.build_post_attn_kernel``), ``BLOCKS``
-CTAs x ``THREADS`` threads, for S = ``tokens`` decode rows, ``q_len`` consecutive
-rows a request (each row below is per token)::
+Traced into the fused layer kernel (``post_attn.build_post_attn_kernel``) for S =
+``tokens`` decode rows, ``q_len`` consecutive rows a request. It reads what the unfused
+path leaves in memory (the all-reduce's ``ar`` / ``res`` pair, the loaded weights, the
+bound caches) and writes what ``fused_qknorm_idxrqknorm`` writes, so either path can
+run any layer; the norms, RoPE and reduction orders follow the aiter kernels the
+unfused path uses (see each stage), and the qkv / index GEMV is FP8 where the unfused
+path's is bf16. Per token::
 
     acc = ar + res (f32)  -> residual out bf16(acc)
       -> gemma RMSNorm -> per-token FP8 (amax / FP8_MAX, true divide)
@@ -12,12 +16,6 @@ rows a request (each row below is per token)::
       -> per-head gemma norm + partial NeoX RoPE
       -> q, index_q out (bf16); K / V -> page-16 SHUFFLE cache (separate K and V
          planes, the layer's fixed scale); index_k -> index cache (E4M3, unit scale)
-
-It reads what the unfused path leaves in memory (the ``ar`` / ``res`` pair of the
-all-reduce, the loaded weights, the bound caches) and writes what
-``fused_qknorm_idxrqknorm`` writes, so either path can run any layer. The norms,
-RoPE and reduction orders follow the aiter kernels the unfused path uses (see each
-stage); the qkv / index GEMV is FP8 where the unfused path's is bf16.
 """
 
 import flydsl.compiler as flyc
@@ -78,12 +76,7 @@ ELEMS = 4  # per lane in a head task: 32 lanes x 4 = 128, the aiter kernel's spl
 PAGE_BYTES = PAGE16 * HEAD_DIM  # one page-16 of one kv head (fp8)
 # page-16 ids a cache block spans in a K or V plane
 BLOCK_PAGES = SPARSE_BLOCK // PAGE16
-# GEMV tasks, head tasks (every token of a head on one CTA) and the tokens' norm
-# tasks each own a CTA, in this order; a head CTA's half waves hold the tokens.
-# The rank's own rows (q | k | v | its index q | index k) are the first ONE_GEMV
-# tasks under indexer context parallelism too, and its other index q heads' the
-# OTHER_GEMV after the norm tasks, run only in a step that needs them: the CTA
-# layout of a step without long requests is the one-head build's.
+# other index q heads' GEMV last, so a step without long requests keeps the one-head build's layout
 ONE_GEMV = qkv_rows(1) // ROWS_PER_TASK
 OTHER_GEMV = (TP - 1) * HEAD_ROW_GROUPS
 HT0 = ONE_GEMV
@@ -96,7 +89,7 @@ assert HIDDEN // 4 % THREADS == 0
 SCRATCH_QKV = 0  # (value, tag) pairs, one per qkv row
 SCRATCH_X8 = MAX_TOKENS * MAX_QKV_ROWS * 8  # S > 2: the norm tasks' x8 rows, words
 SCRATCH_X8S = SCRATCH_X8 + MAX_TOKENS * HIDDEN // 4 * 8  # and their scales
-# fused layer kernel only: a head task's / the residual's done flags
+# the head tasks' and the residual writers' done flags
 SCRATCH_HDONE = SCRATCH_X8S + MAX_TOKENS * 8
 SCRATCH_RDONE = SCRATCH_HDONE + MAX_TOKENS * N_HEAD_TASKS * 8
 SCRATCH_BYTES = SCRATCH_RDONE + MAX_TOKENS * 8
@@ -174,12 +167,13 @@ def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, eps, tokens, heads, ptrs, signal, long_step=None,
 ):  # fmt: skip
-    """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
-    each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
-    XT0 .., in a step where ``long_step()``), the head tasks (CTAs HT0 .., a token
-    per half wave) and, with S > 2, one norm task per token (CTAs NT0 ..) feeding
-    the GEMV tasks. ``signal``: the head tasks' and the residual writers' done
-    flags."""
+    """K1's body: the GEMV tasks, the head tasks and, with S > 2, a norm task per token.
+
+    A GEMV task computes ROWS_PER_TASK rows of the ``heads`` projection: the rank's own
+    on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs XT0 .. in a step where
+    ``long_step()``. The head tasks run on CTAs HT0 .., a token per half wave; the norm
+    tasks, on CTAs NT0 .., feed the GEMV tasks. ``signal``: the head tasks' and the
+    residual writers' done flags."""
     rows = heads.rows
     (
         ar,
@@ -188,8 +182,7 @@ def emit_pre_attn(
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
     ) = ptrs  # fmt: skip
 
-    # stores K4 reads in the same launch: device-coherent like the mailboxes, so a
-    # done flag needs their completion, not an L2 writeback
+    # K4 reads these in-launch: device-coherent stores, so a flag needs completion, not writeback
     cm_out = CM_DEV
 
     def publish_done(mb_addr, idx, who=None):
@@ -200,9 +193,8 @@ def emit_pre_attn(
         if (tid == 0) if who is None else who:
             mb_put(mb_addr, idx, fx.Int32(1))
 
-    # acc = bf16(sum of partials) + residual, f32; the norm reads acc unrounded.
-    # Elements are laid out as the fused all-reduce's logical threads (8 each): this
-    # lane holds lt0 and, in lanes < 32, lt1, so rstd reduces in its order.
+    # acc = bf16(sum of partials) + residual in f32, read unrounded by the norm; a lane holds
+    # the fused all-reduce's logical threads lt0 and (lanes < 32) lt1, so rstd sums in its order
     lts = [wave * 96 + lane, wave * 96 + 64 + fx.min(lane, 31)]
 
     def load_norm_inputs(toks):
@@ -247,7 +239,6 @@ def emit_pre_attn(
                         toks[j] * HIDDEN + lts[1] * 8,
                         cache_modifier=cm_out,
                     )
-        # every token's sum of squares behind one set of barriers
         tots = ar_block_sums(
             [
                 (
@@ -303,8 +294,7 @@ def emit_pre_attn(
         return x_scales
 
     # ============================================ norm tasks (S > 2)
-    # (S <= 2 the GEMV tasks normalize every token themselves, which is faster
-    # there and slower past it)
+    # S <= 2: the GEMV tasks normalize every token themselves, faster there and slower past it
     if const_expr(tokens > 2):  # noqa: SIM102
         if (bid >= NT0) & (bid < NT0 + tokens):
             tk = bid - NT0
@@ -329,8 +319,7 @@ def emit_pre_attn(
                 mb_put(x8s_mb, tk, x_scale)
 
     # ============================================ GEMV tasks (one per CTA)
-    # CTA bid < ONE_GEMV: row group bid of q | k | v, then the own index q head's
-    # and index k's (the identity in the one-head build)
+    # bid < ONE_GEMV: q | k | v, own index q, index k row groups (one-head build: rg = bid)
     own_q = (LOCAL_Q_HEADS + 2) * HEAD_ROW_GROUPS
     rg = (bid < own_q).select(
         bid,
@@ -350,10 +339,7 @@ def emit_pre_attn(
     if gemv:
         if const_expr(tokens <= 2):
             raw_g, raw_ar = load_norm_inputs(list(range(tokens)))
-        # weight stream after the norm's inputs: the norm waits on its loads in issue
-        # order (vmcnt), so it would otherwise wait for the 96 KB of weights too; the
-        # scheduling barrier keeps the compiler from interleaving them again (nothing
-        # before it uses a loaded value, so it does not wait either)
+        # weight loads after the norm's: vmcnt waits in issue order; the sched_barrier pins that
         rocdl.sched_barrier(0)
         r_w = rsrc(w_qkv)
         # 64-k chunk kc of row group rg is 1 KB at ((rg*K/32 + 2kc)*512); lane l
@@ -371,7 +357,7 @@ def emit_pre_attn(
                     )
                 )
             )
-        ws = fx.Float32(  # row tid % 16's scale, sampled below by tid < 16 tokens
+        ws = fx.Float32(  # row tid % 16's scale, read below by tid < 16 * tokens
             bo.buffer_load(
                 rsrc(s_qkv),
                 rg * ROWS_PER_TASK + tid % ROWS_PER_TASK,
@@ -386,8 +372,7 @@ def emit_pre_attn(
             if bid < tokens:
                 publish_done(signal[1], bid)  # the residual
         else:
-            # the norm tasks' scales (each published after its row's plain x8 words),
-            # then every row, 16 B a load
+            # poll the scales first: each is published after its row's plain x8 words
             got = mb_poll([(x8s_mb, tk, 1) for tk in range(tokens)])
             x_scales = [got[tk][0].bitcast(fx.Float32) for tk in range(tokens)]
             fx.memory_fence(
@@ -410,9 +395,7 @@ def emit_pre_attn(
                         x8 + v * 4,
                     )
             gpu.barrier()
-        # 12 chunks per wave: two 16x16x32 FP8 MFMAs each (k halves of 8 bytes).
-        # B column l % 16 is token l % 16 (token 0 past the last): C column t is
-        # token t's rows, the weight stream is the same for any token count.
+        # B column l % 16 is token l % 16 (the last past it): one weight stream for any token count
         col_tok = fx.min(lane % 16, tokens - 1)
         c = fx.Vector.filled(4, 0.0, fx.Float32)
         for cc in range_constexpr(CHUNKS_PER_WAVE):
@@ -559,8 +542,7 @@ def emit_pre_attn(
         publish_done(signal[0], tid * N_HEAD_TASKS + ht, tid < tokens)
 
 
-# the fused layer kernel's K1 pointers that do not change per step, in its device
-# array (the rest are K4's own, or kernel arguments)
+# K1's pointers fixed across steps, passed in a device array (the rest are K4's or kernel args)
 K1_ARGS = (
     "ar", "g_in", "w_qkv", "s_qkv", "g_q", "g_k", "g_iq", "g_ik", "cos_sin",
     "index_cache", "iq_out", "scratch",
@@ -573,9 +555,10 @@ def emit_k1(
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores.
+
     ``x8``: tokens * HIDDEN / 4 words of LDS, ``red``: WAVES * 256 floats, ``qs``:
-    tokens * heads.count * HEAD_DIM / 2 floats. ``q_len``: tokens per request (speculative
-    verify rows). ``heads``: the index q heads of the fused projection
+    tokens * heads.count * HEAD_DIM / 2 floats. ``q_len``: tokens per request
+    (speculative verify rows). ``heads``: the fused projection's index q heads
     (``IndexHeads``). The head tasks and residual writers publish done flags
     (SCRATCH_HDONE / SCRATCH_RDONE) for K4."""
     (
@@ -587,8 +570,7 @@ def emit_k1(
     qkv_mb = scratch + fx.Int64(SCRATCH_QKV)
     x8_mb = scratch + fx.Int64(SCRATCH_X8)
     x8s_mb = scratch + fx.Int64(SCRATCH_X8S)
-    # Plain names, not method calls: flydsl's AST rewriter carries every local whose
-    # method is called inside a dynamic if/for as loop state.
+    # plain names: FlyDSL carries a local whose method a dynamic if / for calls as loop state
     mb_put = mbox.put
     mb_put_words = mbox.put_words
     mb_poll = mbox.poll
@@ -654,8 +636,7 @@ def emit_k1(
         (scratch + fx.Int64(SCRATCH_HDONE), scratch + fx.Int64(SCRATCH_RDONE)),
         long_step,
     )  # fmt: skip
-    # the scorers: the idle CTAs first (the norm tasks' come first but finish
-    # early), then the GEMV CTAs, the head CTAs last
+    # scorers: norm CTAs (done early) and idle CTAs first, then the GEMV CTAs, the head CTAs last
     score_base = ONE_GEMV + N_HEAD_TASKS
     hdone_mb = scratch + fx.Int64(SCRATCH_HDONE)
 

@@ -176,7 +176,7 @@ def _gemv_steps(c, k, split, tiled=False):
 
 
 def gemv_fp8_loads(c, w, ws, k, rg, split=None, tiled=False, row_major=False):
-    """Issue all weight loads of ``gemv_fp8``'s rows for this wave."""
+    """Issue this wave's weight loads of FP8 GEMV rows 16 ``rg`` .. for ``gemv_fp8_mfmas``."""
     steps = (k + 127) // 128
     r_w, r_ws = rsrc(w), rsrc(ws)
     if const_expr(tiled):
@@ -234,7 +234,7 @@ def poll_copy(c, idx, width, spans, live=None):
 
 @flyc.jit
 def _poll_store_batches(c, chunks):
-    """Copy ``poll_copy``'s chunks into LDS, POLL_MAX pairs a round trip."""
+    """Copy ``poll_copy``'s chunks into LDS."""
     for b0 in range_constexpr(0, len(chunks), POLL_MAX):
         batch = chunks[b0 : b0 + POLL_MAX]
         got = c["poll"]([(r, p(fx.min(u, n - 1)), 1) for r, p, n, _, u in batch])
