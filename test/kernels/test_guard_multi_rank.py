@@ -8,6 +8,7 @@ waits for each rank itself: a torchrun-style launcher tears the group down when 
 which would hide whether each rank stopped on its own."""
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,7 @@ class TestGuardMultiRank(CustomTestCase):
         stop time in seconds from the spawn (absent for a rank killed at the hang limit), the
         return code and the completed launches."""
         progress = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, progress, ignore_errors=True)
         procs = {}
         for r in range(tp):
             env = {**os.environ}
