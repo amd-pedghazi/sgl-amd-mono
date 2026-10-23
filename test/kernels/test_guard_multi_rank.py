@@ -1,20 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The guarded waits fail-stop across ranks (RFC #43949 section 8), not just on one GPU
-(test_guard_hip.py). A fault on one rank (SGLANG_AMD_MONO_FAULT_INJECT) stalls its K2 or FFN
-launch at a wait; at the deadline that rank stops (a GPU fault at the null page) and flags its
-peers, so every rank stops and none finishes its step, so no token of it can be sent. Without a
-fault every rank finishes every launch.
+"""A fault on one rank stops every rank's launch (RFC #43949 section 8), not only its own GPU's.
 
-The harness owns the ranks itself: it spawns one worker a rank with an explicit file init method
-and waits for each on its own, so one rank's fault never signals the siblings (a
-torchrun-style launcher tears the whole group down when a rank dies, which would hide whether
-each rank stopped by itself). For each rank it reads how far it got (the worker's per-launch
-progress lines) and when its process exited, and checks that every rank ran at least the `after`
-launches of the clean prefix, that none finished, and that each stopped within the faulted rank's
-stop plus one more deadline and a small margin. The subprocess hard timeout is only the hang
-limit, not that bound. The fault is placed early (after 3 launches) and late (after 6), in launch
-and step mode at TP4, and once cross-GPU at TP2, on the K2 launch (it carries both cross-rank
-reduces) and the FFN launch."""
+An injected fault (``SGLANG_AMD_MONO_FAULT_INJECT``) stalls rank 1's K2 or FFN launch at a
+wait; at the deadline rank 1 stops and flags its peers, so each rank must stop within one more
+deadline without finishing the step, and no token of it can be sent. The harness spawns and
+waits for each rank itself: a torchrun-style launcher tears the group down when a rank dies,
+which would hide whether each rank stopped on its own."""
 
 import os
 import subprocess
@@ -45,9 +36,9 @@ def _gfx950_gpus() -> int:
 @unittest.skipIf(_gfx950_gpus() < 4, "needs 4 gfx950 GPUs")
 class TestGuardMultiRank(CustomTestCase):
     def _spawn(self, tp, launch, mode, fault, hard_timeout):
-        """Spawn one worker a rank (explicit file init method) and wait for each on its
-        own. Return, a rank at a time: its stop time (seconds from the spawn, or None if it had
-        to be killed at the hang limit), its return code, and its completed-launch count."""
+        """Spawn one worker a rank and wait for each on its own; return per-rank dicts of the
+        stop time in seconds from the spawn (absent for a rank killed at the hang limit), the
+        return code and the completed launches."""
         progress = Path(tempfile.mkdtemp())
         procs = {}
         for r in range(tp):
@@ -112,8 +103,7 @@ class TestGuardMultiRank(CustomTestCase):
             self.assertEqual(done[r], LAUNCHES, f"rank {r} did {done[r]} launches")
 
     def test_fault_stops_every_rank_tp4(self):
-        # one rank's fault stops every rank, on the K2 and FFN launches, early (after 3) and late
-        # (after 6), in launch and step mode: every rank ran the clean prefix and then stopped
+        # early (after 3) and late (after 6) faults, on K2 and the FFN launch, in either mode
         for launch in ("k2", "ffn"):
             for after in (3, 6):
                 for mode in ("launch", "step"):
@@ -125,8 +115,7 @@ class TestGuardMultiRank(CustomTestCase):
                     )
 
     def test_fault_stops_every_rank_tp2_cross_gpu(self):
-        # cross-GPU TP2: rank 1 times out at its own K2 wait and writes the peer
-        # flags; the other rank sees them at its next wait and stops on its own
+        # the other rank sees rank 1's flags at its next wait and stops on its own
         stop, rc, done = self._spawn(2, "k2", "launch", "1:1:3", hard_timeout=420)
         self._assert_fault(stop, rc, done, 2, 3, "tp2/k2/after3")
 

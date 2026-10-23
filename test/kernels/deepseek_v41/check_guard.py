@@ -1,21 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Multi-rank worker for the guarded-wait fail-stop test (RFC #43949 section 8): run a
-production launch in a loop on this rank. The harness (test_guard_multi_rank.py) spawns one
-worker a rank with an explicit file init method and waits for each on its own, so a
-fault on one rank does not take the siblings down with it.
+"""One rank's worker for ``test_guard_multi_rank.py``: a production launch in a loop.
 
-With a fault injected on one rank (SGLANG_AMD_MONO_FAULT_INJECT=rank:site:after, read by the
-runner at construction) that rank's wait at ``site``, once ``after`` launches have run, times
-out at its deadline, stops the launch with a GPU fault at the null page and flags every peer,
-so each peer's next guarded wait stops too and no rank reaches the end. Every completed launch
-appends a line to this rank's progress file, so the harness sees how far each rank got before
-it stopped; a clean run completes all of them. The first launch runs under the runner's default
-deadline and ends in a barrier, so the short deadline below times a steady state rather than one
-rank waiting on another's first compile.
-
-``--launch k2`` drives K2 (the attention back and its TP reduce, then the FFN seam, MoE and
-all-reduce: both cross-rank reduces); ``--launch ffn`` the FFN launch alone; ``--mode step``
-adds the step's closing TP collective, as a serving step does."""
+With ``SGLANG_AMD_MONO_FAULT_INJECT=rank:site:after``, that rank's wait at ``site`` times out
+once ``after`` launches have run, stops its launch and flags every peer, so each peer's next
+guarded wait stops too. Each completed launch appends a line to this rank's progress file. The
+first launch runs under the default deadline and ends in a barrier, so the short deadline times
+a steady state, not a peer's first compile. ``--launch k2`` drives K2, which carries both
+cross-rank reduces; ``--launch ffn`` the FFN launch; ``--mode step`` adds the step's closing TP
+collective."""
 
 import argparse
 import os
@@ -29,9 +21,8 @@ SHORT_DEADLINE_S = 6.0
 
 
 def _no_core():
-    """PR_SET_DUMPABLE 0 so a deliberate GPU fault writes no core whatever the host
-    core_pattern is. These ranks fault on purpose; fail loudly if the call does not take,
-    rather than pipe cores to a shared disk."""
+    """Keep this rank's deliberate GPU fault from dumping a core, whatever the host's
+    ``core_pattern``; refuse to run where that fails."""
     import ctypes
 
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -79,9 +70,7 @@ def main():
     rank, tp = args.rank, args.world_size
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
-    # the harness's explicit init method, a file: a port picked in advance can be taken before
-    # rank 0 listens on it. No torchrun, so one rank's fault never signals the others, and the
-    # harness waits for each rank on its own
+    # a file init method: a port picked in advance can be taken before rank 0 listens on it
     dist.init_process_group(
         backend="nccl",
         init_method=f"file://{args.init_file}",
@@ -104,8 +93,7 @@ def main():
         aw, swa, swa_block, pos = _k2_inputs(tp, dev)
         runner.res_mid[:ROWS], runner.post_a[:ROWS] = res, post
         runner.comb_a[:ROWS], runner.pre_a[:ROWS] = comb, pre
-        # Site 1 is K2's srdy wait and exists only when a token has keys.
-        # Give each token ROWS window keys; the zeroed key table points to SWA slot 0.
+        # site 1, K2's srdy wait, needs keys: ROWS window keys a token, all at SWA slot 0
         runner.klen[:ROWS].fill_(ROWS)
 
         def one():
@@ -116,14 +104,13 @@ def main():
         def one():
             runner.ffn(mw, part.clone(), res.clone(), post, comb, pre)
 
-    # one flushed line a completed launch, so the count survives the process's own stop: the
-    # faulted rank writes `after` of them before it stalls, a clean rank writes every one
+    # a flushed line a launch, so the count survives the process's own stop
     path = os.path.join(args.progress_dir, f"rank{rank}.log")
     with open(path, "a", buffering=1) as progress:
         for i in range(args.launches):
             one()
             if args.mode == "step":
-                # the step's closing TP collective (the logits gather)
+                # the step's closing TP collective, as the logits gather
                 dist.all_reduce(logits)
             torch.cuda.synchronize()
             progress.write(f"{i}\n")
