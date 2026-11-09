@@ -44,6 +44,7 @@ the reserved dummy slot, as the normal path does.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 from typing import Any
 
@@ -75,6 +76,10 @@ from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG, fused
 
 MAX_ROWS = 48  # the rows a launch takes at most (``layer.MAX_TOKENS``)
+# the monokernel runs steps of up to MONO_MAX rows; with SGLANG_AMD_MONO_ASM_WIDE=1 (TP4),
+# the asm decode layers (asm/layer.py) run the decode and DSpark verify steps above, up to WIDE_MAX
+MONO_MAX, WIDE_MAX = MAX_ROWS, 256
+WIDE = os.environ.get("SGLANG_AMD_MONO_ASM_WIDE", "0") == "1"
 
 _SHARED = ("gate_proj", "up_proj", "down_proj")
 # the checkpoint's shared expert tensors, as the model loader reads them
@@ -138,6 +143,8 @@ SGLANG_READS = {
         "expert_distribution_recorder_mode",
         "disaggregation_mode",
         "disaggregation_transfer_backend",
+        "speculative_num_draft_tokens",
+        "cuda_graph_config",
     ),
     "srt/environ.py": (
         "SGLANG_DSV4_FP4_EXPERTS",
@@ -329,6 +336,20 @@ SGLANG_READS = {
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
+        # the wide path's widths: the server's resolved decode capture sizes (``_wide_widths``)
+        "get_context",
+        "is_config_namespace_published",
+        "get_exec",
+        "get_spec",
+        '"exec"',
+        '"spec"',
+    ),
+    "srt/model_executor/cuda_graph_config.py": (
+        "Backend",
+        "DISABLED",
+        "decode",
+        "backend",
+        "bs",
     ),
     "srt/utils/common.py": ("get_bool_env_var",),
 }
@@ -449,7 +470,47 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             "the shared expert's FP8 checkpoint tensors were not seen at load "
             f"(layers {unseen})"
         )
+    if WIDE:
+        from sgl_amd_mono.deepseek_v41.asm.kernels.build import toolchain_missing
+
+        if get_parallel().tp_size != 4:
+            reasons.append("SGLANG_AMD_MONO_ASM_WIDE: the asm decode layers need TP4")
+        if missing := toolchain_missing():
+            reasons.append(
+                f"SGLANG_AMD_MONO_ASM_WIDE: building the asm kernels needs {missing}"
+            )
     return reasons
+
+
+def _wide_widths() -> tuple[int, ...]:
+    """The asm layers' widths: this server's captured decode or DSpark verify rows above
+    MONO_MAX (every width up to WIDE_MAX without graphs), read once its configuration is
+    published. Before that (when the binding aligns the capture sizes) there are none, so
+    the capture sizes stay the monokernel's and the asm layers take the captured sizes as
+    they are."""
+    if not WIDE:
+        return ()
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.runtime_context import get_context, get_exec, get_spec
+
+    ctx = get_context()
+    if not (
+        ctx.is_config_namespace_published("exec")
+        and ctx.is_config_namespace_published("spec")
+    ):
+        return ()
+    sp = get_spec()
+    tokens = (
+        int(sp.speculative_num_draft_tokens or 1) if sp.speculative_algorithm else 1
+    )
+    graph = get_exec().graph.cuda_graph_config
+    if graph is None or graph.decode.backend == Backend.DISABLED:
+        rows = range(MONO_MAX + 1, WIDE_MAX + 1)
+    else:
+        rows = [tokens * bs for bs in graph.decode.bs or []]
+    return tuple(
+        sorted({w for w in rows if MONO_MAX < w <= WIDE_MAX and w % tokens == 0})
+    )
 
 
 def _qkv_linears(attn) -> list:
@@ -725,12 +786,14 @@ def _launch(
     prev_pre,
     capture=None,
     tok_par=False,
+    asm=None,
 ):
     """K1, then K2, of layer ``L``: the previous layer's pending post (x, residual,
     post, comb) and pre in; K2's (x, residual, post, comb, pre) out, this layer's
     post pending. With no post owed (x None) the residual arrives settled: the
     first layer's broadcast embedding (no pre: copy 0), an Engram layer's
-    residual, or a draft stage's input."""
+    residual, or a draft stage's input. A step of more than MONO_MAX rows runs
+    the asm decode layers (``asm``)."""
     from sglang.srt.model_executor.forward_context import (
         get_attn_backend,
         get_token_to_kv_pool,
@@ -738,14 +801,18 @@ def _launch(
 
     from sgl_amd_mono.deepseek_v41.gfx950.runner import SLOT_DTYPES
 
-    x, residual, post, comb = pending_post
-    if L.swa is None:  # the layer's caches, at its first launch
+    if L.swa is None:  # the layer's caches at its first launch (the asm K1's too)
         pool = get_token_to_kv_pool()
         L.swa, L.swa_block = pool.get_swa_raw_buffer(L.i), pool.get_swa_key_page_size()
         if L.ratio:
             # SGLang types the compressed cache as e4m3; K2 addresses its records' bytes
             L.comp = pool.get_extra_key_buffer(L.i).view(torch.uint8)
             L.comp_block = pool.get_extra_key_page_size(L.i)
+    if pending_post[1].shape[0] > MONO_MAX:
+        return asm.layer(
+            L, plan, positions, forward_batch, pending_post, prev_pre, capture
+        )
+    x, residual, post, comb = pending_post
     backend, M = get_attn_backend(), residual.shape[0]
     if "k1" not in plan.state:
         # the forward's first K1 converts them where needed; a graph records the copies
@@ -938,10 +1005,13 @@ def _index_plane(*, L, M: int, meta, raw_idx) -> tuple:
 class _Built:
     """One rank's monokernels: the runner, each layer's weights, and the forward."""
 
-    def __init__(self, lm, runner, layers: dict):
+    def __init__(self, lm, runner, layers: dict, asm=None):
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
+        # the asm decode layers (asm/layer.py) above MONO_MAX rows, or None
+        self.asm = asm
         self._normal_moe = lm.model.layers[min(layers)].mlp
-        # DSpark's captures, [MAX_ROWS, layers * hidden]: K1 writes each layer's block
+        # DSpark's captures, [MAX_ROWS, layers * hidden], or WIDE_MAX rows with ``asm``:
+        # K1 writes each layer's block
         self._packed: torch.Tensor | None = None
 
     def forward(
@@ -996,8 +1066,9 @@ class _Built:
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
         pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
-        plan.state["tok_par"] = self.runner.tok_par(x.shape[0])
-        tok_par = plan.state["tok_par"]
+        # the asm decode layers compute every row on every rank
+        tok_par = x.shape[0] <= MONO_MAX and self.runner.tok_par(x.shape[0])
+        plan.state["tok_par"] = tok_par
         fuse = fused.enabled()
         for i in range(m.start_layer, m.end_layer):
             engram = m.layers[i].engram
@@ -1163,7 +1234,7 @@ class _Built:
         out = _launch(
             self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
             capture=lambda L, M: self._capture(plan, L, M),
-            tok_par=plan.state["tok_par"],
+            tok_par=plan.state["tok_par"], asm=self.asm,
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
 
@@ -1196,7 +1267,8 @@ class _Built:
         if self._packed is None:
             no_capture("DSpark's capture buffer")
             self._packed = self.runner.res_mid.new_empty(
-                MAX_ROWS, len(order) * self.runner.res_mid.shape[-1]
+                WIDE_MAX if self.asm is not None else MAX_ROWS,
+                len(order) * self.runner.res_mid.shape[-1],
             )
         h = self.runner.res_mid.shape[-1]
         j = order.index(L.i)
@@ -1312,16 +1384,33 @@ def _build(model, hf_config, ctx) -> _Built:
     }
     k2 = {(L.ratio > 0, L.index) for L in layers.values()}
     # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
-    widths = list(ctx.widths)
+    widths = [w for w in ctx.widths if w <= MONO_MAX]
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
         runner.precompile(m, k1=k1, k2=k2, k2i=k2i, tok_par=runner.tok_par(m))
     glue.prewarm(device)
     fused.prewarm(model)
-    return _Built(model, runner, layers)
+    asm = None
+    if max(ctx.widths) > MONO_MAX:
+        from sgl_amd_mono.deepseek_v41.asm.layer import AsmLayers
+
+        # collective (IPC buffers): every rank builds it here, in the same order
+        asm = AsmLayers(
+            p.tp_rank, p.tp_group.cpu_group, p.tp_size, deadline_s=ctx.deadline_s
+        )
+        for i, L in layers.items():
+            asm.add_layer(i, L)
+    return _Built(model, runner, layers, asm)
 
 
-SPEC = MonoSpec(
+class _Spec(MonoSpec, frozen=True):
+    def widths(self, isa: str) -> tuple[int, ...]:
+        """The monokernel's widths, and the asm layers' (``_wide_widths``) on gfx950."""
+        wide = _wide_widths() if isa == "gfx950" else ()
+        return tuple(sorted({*self.devices[isa].widths, *wide}))
+
+
+SPEC = _Spec(
     name="deepseek_v41_hip",
     devices={
         "gfx950": DeviceLimits(
@@ -1370,6 +1459,9 @@ SPEC = MonoSpec(
     api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
     load_tensor=_load_tensor,
-    # a routed step scores every index source with K2i (_select)
-    unread_metadata=frozenset({StepMetadata.LOW_RATIO_DECODE_SCHEDULE}),
+    # a routed step scores every index source with K2i (_select); the asm layers' K1
+    # (SGLang's attention half) runs SGLang's decode indexer, which reads it
+    unread_metadata=frozenset()
+    if WIDE
+    else frozenset({StepMetadata.LOW_RATIO_DECODE_SCHEDULE}),
 )
