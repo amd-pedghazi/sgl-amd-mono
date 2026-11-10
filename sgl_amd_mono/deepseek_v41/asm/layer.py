@@ -3,10 +3,10 @@
 vllm#65421's asm K2 (the FFN half: mHC seam, router, shared and routed experts, the
 combine with all-reduce #2) after a K1 (the attention half with all-reduce #1).
 
-K1 is SGLang's own attention half of the layer (the fused boundary, the input norm and
-``self_attn``) unless ``SGLANG_AMD_MONO_ASM_K1`` names the asm K1's chain ("v3" or
-"v1"; default "0": SGLang's): then ``k1.AsmK1`` on SGLang's caches and key lists, with
-SGLang's compressor and decode indexer as an index source's index step. Either way the
+K1 is ``k1.AsmK1``, the asm K1's chain that ``SGLANG_AMD_MONO_ASM_K1`` names ("v3", the
+default, or "v1"), on SGLang's caches and key lists, with SGLang's compressor and decode
+indexer as an index source's index step; "0" keeps SGLang's own attention half of the
+layer (the fused boundary, the input norm and ``self_attn``). Either way the
 state between the halves is the fused boundary's: (x_attn, residual, post, comb, pre),
 and K2 returns the layer's (x, residual, post, comb, pre) as the monokernel's K2 does.
 
@@ -17,14 +17,12 @@ AsmK1 (one K1Runner and one WoBAllReduce), and each layer's weights. Every rank 
 the same launches in the same order.
 
 ``SGLANG_AMD_MONO_ASM_WIRE``: "bf16" (default, exact as the custom all-reduce) or
-"fp8" (MXFP8) for the asm all-reduces. ``SGLANG_AMD_MONO_ASM_K2_V3``: "0" (default,
-the v1 chain: the norm first) or "1" (vLLM's chain: MXFP8 of the seam output before
-the norm's rstd). ``SGLANG_AMD_MONO_ASM_CHECK=<dir>`` (tests, eager only): every wide
+"fp8" (MXFP8) for the asm all-reduces. ``SGLANG_AMD_MONO_ASM_K2`` picks K2's chain
+(``k2.py``). ``SGLANG_AMD_MONO_ASM_CHECK=<dir>`` (tests, eager only): every wide
 layer also runs SGLang's FFN half on the same K1 outputs and appends their per-token
 differences to ``<dir>/rank<r>.jsonl``.
 """
 
-import importlib.util
 import json
 import os
 
@@ -93,71 +91,11 @@ def wire() -> str:
 
 
 def k1_chain() -> str | None:
-    """The asm K1's chain, or None for SGLang's attention half (the default)."""
-    c = os.environ.get("SGLANG_AMD_MONO_ASM_K1", "0")
+    """The asm K1's chain ("v3" by default), or None for SGLang's attention half ("0")."""
+    c = os.environ.get("SGLANG_AMD_MONO_ASM_K1", "v3")
     if c not in ("0", "v3", "v1"):
         raise ValueError(f"SGLANG_AMD_MONO_ASM_K1={c!r}: 0, v3 or v1")
     return None if c == "0" else c
-
-
-class _K2Stand:
-    """The asm K2 with ``AsmK2``'s interface, for as long as ``asm/k2.py`` is absent:
-    K2Runner's chain with the combine folded into CombAllReduce."""
-
-    def __init__(self, rank: int, cpu_group, guard, v3: bool = True):
-        from sgl_amd_mono.deepseek_v41.asm.ar_runner import CombAllReduce
-        from sgl_amd_mono.deepseek_v41.asm.k2_runner import K2Runner
-
-        self.run = K2Runner("chain", v3=v3)
-        self.car = CombAllReduce(rank, cpu_group, 4, guard=guard)
-
-    def weights(self, ffn) -> dict:
-        """The plugin's FFNWeights as K2Runner reads them: the routed experts in place,
-        fn_hl (the mHC fn as bf16 hi / lo fragments) and the eps words new."""
-        from sgl_amd_mono.deepseek_v41 import HF_CONFIG
-        from sgl_amd_mono.deepseek_v41.asm.k2_runner import f32bits
-        from sgl_amd_mono.deepseek_v41.asm.kernels import ffn_seam
-
-        u8, fn = torch.uint8, ffn.hc_ffn_fn.float().contiguous()
-        return dict(
-            fn=fn,
-            fn_hl=ffn_seam.fn_hl(fn),
-            scale=ffn.hc_ffn_scale.float().contiguous(),
-            base=ffn.hc_ffn_base.float().contiguous(),
-            norm_w=ffn.ffn_norm.to(torch.bfloat16).contiguous(),
-            rms_eps=f32bits(HF_CONFIG["rms_norm_eps"]),
-            hc_eps=f32bits(HF_CONFIG["hc_eps"]),
-            post_alpha=f32bits(2.0),
-            norm_eps=f32bits(HF_CONFIG["rms_norm_eps"]),
-            gate=ffn.gate_w.to(torch.bfloat16).contiguous(),
-            bias=ffn.bias.float().contiguous(),
-            sw=ffn.sgu.contiguous(),
-            ss=ffn.sgu_s.view(u8).contiguous(),
-            dw=ffn.sw2.contiguous(),
-            ds=ffn.sw2_s.view(u8).contiguous(),
-            w13=ffn.w13.view(u8),
-            s13=ffn.w13_s.view(u8),
-            w2=ffn.w2.view(u8),
-            s2=ffn.w2_s.view(u8),
-        )
-
-    def __call__(self, w, x_attn, residual, post_a, comb_a, pre_a, wire: str):
-        m = x_attn.shape[0]
-        _, res, post, comb, pre = self.run(
-            w, x_attn, residual, post_a.view(m, HC, 1), comb_a, pre_a, fold=True
-        )
-        return self.car(*self.run.comb_in, m, wire), res, post, comb, pre
-
-    def errors(self) -> int:
-        return self.car.errors()
-
-
-def _k2_class():
-    if importlib.util.find_spec("sgl_amd_mono.deepseek_v41.asm.k2") is None:
-        return _K2Stand
-    from sgl_amd_mono.deepseek_v41.asm.k2 import AsmK2
-
-    return AsmK2
 
 
 def k1_keys(plan, positions, forward_batch, m: int):
@@ -259,12 +197,9 @@ class AsmLayers:
             raise ValueError(f"the asm decode layers are written for TP4, not TP{tp}")
         self.rank, self.wire = rank, wire()
         self.guard = AsmGuard(rank, cpu_group, 4, deadline_s=deadline_s)
-        k2 = _k2_class()
-        if k2 is _K2Stand:
-            v3 = os.environ.get("SGLANG_AMD_MONO_ASM_K2_V3", "0") == "1"
-            self.k2 = k2(rank, cpu_group, guard=self.guard, v3=v3)
-        else:
-            self.k2 = k2(rank, cpu_group, guard=self.guard)
+        from sgl_amd_mono.deepseek_v41.asm.k2 import AsmK2
+
+        self.k2 = AsmK2(rank, cpu_group, guard=self.guard)
         self.k1, chain = None, k1_chain()
         if chain is not None:
             from sgl_amd_mono.deepseek_v41.asm.ar_runner import WoBAllReduce
