@@ -327,7 +327,9 @@ def main():
         # the k1 launch's outputs; a control graph copies them without the launch
         outs = [r.q[:M], r.res_mid[:M], r.post_a[:M], r.comb_a[:M], r.pre_a[:M]]
 
-        control, _ = captured_growth(lambda: [d.copy_(d) for d in outs], dev)
+        control, control_graph = captured_growth(
+            lambda: [d.copy_(d) for d in outs], dev
+        )
         capture, graph = captured_growth(launch, dev)
         diff = dict(
             res=0, aux=0, x8=0, x8s=0, nope=0, scale=0, rope=0, replay=0, normed=0

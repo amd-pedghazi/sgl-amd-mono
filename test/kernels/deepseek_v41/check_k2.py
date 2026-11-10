@@ -436,11 +436,16 @@ def main():
     eager = [t.clone() for s in steps for t in s[-1]]
 
     # the same output copies without the launches: what torch's capture itself allocates
-    control, _ = captured_growth(
+    control, control_graph = captured_growth(
         lambda: [d.copy_(d) for s in steps for d in s[-1]], dev
     )
     capture, graph = captured_growth(run_all, dev)
+    # replays only, before the checks below allocate or free anything
     after_capture = torch.cuda.memory_allocated(dev)
+    for _ in range(64):
+        graph.replay()
+    torch.cuda.synchronize()
+    replays = torch.cuda.memory_allocated(dev) - after_capture
     bad_replays = 0
     for i in range(args.replays):
         graph.replay()
@@ -448,8 +453,6 @@ def main():
             torch.cuda.synchronize()
             got = [t for s in steps for t in s[-1]]
             bad_replays += sum(not torch.equal(a, b) for a, b in zip(got, eager))
-    torch.cuda.synchronize()
-    replays = torch.cuda.memory_allocated(dev) - after_capture
     for M, *_, tok_par, outs in steps:
         if tok_par:
             others = torch.ones(M, dtype=torch.bool, device=dev)
