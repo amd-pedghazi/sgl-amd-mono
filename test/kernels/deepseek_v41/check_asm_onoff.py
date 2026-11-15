@@ -7,7 +7,7 @@ combine). So the drift over the 40 layers and the asm K1 are in the result;
 check_asm_layer.py --mode check compares each wide layer's K2 with SGLang's FFN half on
 the same inputs, which has neither.
 
-Roles, one eager server each, with the control's flags (check_asm_layer.py):
+Roles, one eager server each, with the best-image control's flags (check_asm_layer.py):
   std      SGLang's decode path at every width (no --enable-amd-monokernel)
   ctrl     the control: the monokernel up to 48 rows, SGLang's path above
   ctrl2    ctrl again on a new server: the run-to-run noise of the same path
@@ -30,7 +30,7 @@ Prompts (--prompts): gsm8k (default), natural text in SGLang's few_shot_gsm8k fo
 a batch reaches the scheduler as one message; random, check_asm_layer.py's random tokens,
 on which greedy tokens flip at the smallest change.
 
---compare (the FP8-shared-expert reference, gated up to 64
+--compare, after the parent's decision 5 (the FP8-shared-expert reference, gated up to 64
 rows): at 32 and 48 rows every role but std runs the monokernel, so they must agree within
 the run-to-run noise (ctrl2 against ctrl; without ctrl2 exactly: the same tokens, the
 residual within ID_REL). The asm pairs (wide, wide_v1 and k1 against ctrl) at 49-64 rows
