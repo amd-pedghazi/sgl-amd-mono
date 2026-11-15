@@ -90,8 +90,6 @@ def serve(args, out: Path) -> dict:
     env.pop("SGLANG_AMD_MONO_ASM_WIDE", None)
     if args.mode != "kv":
         env["SGLANG_AMD_MONO_ASM_WIDE"] = "1"
-    env["SGLANG_AMD_MONO_ASM_K2_V3"] = "0" if args.k2_v1 else "1"
-    # AsmK2 (asm/k2.py) reads this switch; the stand-in _K2Stand reads K2_V3
     env["SGLANG_AMD_MONO_ASM_K2"] = "v1" if args.k2_v1 else "v3"
     flags = list(CONTROL_FLAGS) + ["--watchdog-timeout", "600"]
     if args.no_shared_fusion:
