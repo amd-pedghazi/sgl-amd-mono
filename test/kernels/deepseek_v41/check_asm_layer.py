@@ -32,7 +32,7 @@ from collections import defaultdict
 from pathlib import Path
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
-# the control's server flags (host, port, parsers and tokenizer left out)
+# the best-image control's server flags (host, port, parsers and tokenizer left out)
 CONTROL_FLAGS = [
     "--tp-size", "4", "--trust-remote-code", "--chunked-prefill-size", "16384",
     "--context-length", "135168", "--cuda-graph-backend-prefill", "disabled",

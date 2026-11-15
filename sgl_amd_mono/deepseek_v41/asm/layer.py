@@ -101,8 +101,9 @@ def k1_chain() -> str | None:
 
 
 class _K2Stand:
-    """The asm K2 with ``AsmK2``'s interface, for as long as ``asm/k2.py`` is absent:
-    K2Runner's chain with the combine folded into CombAllReduce."""
+    """The asm K2 with the contract of M_TRACKS section 2 (``AsmK2``), for as long as
+    ``asm/k2.py`` is absent: K2Runner's chain with the combine folded into
+    CombAllReduce, as the P1 harness runs it."""
 
     def __init__(self, rank: int, cpu_group, guard, v3: bool = True):
         from sgl_amd_mono.deepseek_v41.asm.ar_runner import CombAllReduce

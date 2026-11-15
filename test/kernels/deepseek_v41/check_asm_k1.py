@@ -64,7 +64,7 @@ HEAD, KV = 512, 512
 BLOCK, PAGES = 256, 64  # SGLang's SWA pages hold 256 rows (kv_cache_configurator)
 SWA_PAGES, COMP_PAGES, COMP_BLOCK = 12, 32, 128  # the attend stage's random caches
 SWA_WIDTH, TOPK = 128, 512
-# the mixes: K2's asm bound (check_asm_k2.py's post / comb), |asm - SGLang| <=
+# the mixes: K2's asm bound (check_asm_k2.py's post / comb; F-MA8), |asm - SGLang| <=
 # ASM_MIX_ATOL + ASM_MIX_RTOL · |SGLang|: vLLM's seam sums and iterates in its own order
 ASM_MIX_RTOL, ASM_MIX_ATOL = 2e-3, 1e-5
 ATTN_COS = NUMERICS.bound("k2.attn_out.cosine")
@@ -73,10 +73,10 @@ ATTN_COS = NUMERICS.bound("k2.attn_out.cosine")
 FP8_WIRE_REL = 0.05
 # each launch against fp64 on its own inputs: its bf16 output rounding and f32 sums
 STAGE_REL, STAGE_COS = 4e-3, 0.99999
-# the record and q bound: the front's error against fp64 at most this times
+# the record and q bound (M_TRACKS 3.4): the front's error against fp64 at most this times
 # SGLang's; bit for bit is not reachable (the writers quantize bf16 and f32 sources)
 ERR_RATIO = 1.25
-# an index source's normed input and qr against fp64, at
+# proposed (to agree with Agent M): an index source's normed input and qr against fp64, at
 # most this times SGLang's on v3: its normed is rounded twice (y', then y' · rstd), its qr
 # carries wq_b's MXFP8 rounding (the q vLLM's v3 indexer reads), so about √2 is expected;
 # v1 at most ERR_RATIO
