@@ -69,10 +69,7 @@ def test_the_shared_spec_rechecks_every_requirement():
     """The shared spec re-checks each model's Requirements as SGLang's guard does,
     except dtypes, which SGLang checks on the shared spec alone; a field SGLang adds
     would go unchecked for both models."""
-    try:
-        from sglang.kernels.plugin_kernels.amd.spec import Requirements
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        from sglang.srt.monokernels.spec import Requirements
+    from sglang.srt.monokernels.spec import Requirements
 
     rechecked = {"attention_backends", "server_args", "hf_config", "env"}
     assert set(Requirements.__struct_fields__) == rechecked | {"dtypes"}
@@ -83,10 +80,7 @@ def test_the_shared_spec_rechecks_every_requirement():
 def test_what_the_shared_spec_takes_from_one_model_agrees():
     """SGLang reads the fields the shared spec does not hand to the checkpoint's own
     spec from the shared spec alone, so both models must agree on them."""
-    try:
-        from sglang.kernels.plugin_kernels.amd.spec import MonoSpec
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        from sglang.srt.monokernels.spec import MonoSpec
+    from sglang.srt.monokernels.spec import MonoSpec
 
     dispatched = {
         "features",

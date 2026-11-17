@@ -87,9 +87,6 @@ SGLANG_READS = {
         "spec_info",
         "forward_mode",
         "batch_size",
-    ),
-    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
-    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
         "is_draft_extend_v2",
         "is_decode",
     ),

@@ -33,7 +33,6 @@ import torch
 try:
     from sglang.kernels.plugin_kernels.amd.spec import (
         DeviceLimits,
-        Feature,
         MonoSpec,
         Numerics,
         NumericsKind,
@@ -42,7 +41,6 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels.spec import (
         DeviceLimits,
-        Feature,
         MonoSpec,
         Numerics,
         NumericsKind,
@@ -56,10 +54,7 @@ from sgl_amd_mono.glm53_flash import (
 )
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows
-# (12: two MTP5 or three MTP3 requests)
-WIDTHS = (2, 4, 8, 12, 16)
-# above this width the MoE runs expert-major (``FlashBuild.grouped``)
-GROUPED_FROM = 9
+WIDTHS = (2, 4, 8)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (2, 4, 8)
 # the rows a step runs on the kernels at most at this TP size: at TP2 a sparse-
@@ -79,14 +74,6 @@ SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "page_size",
         "enable_linear_replayssm",
-        "enable_linear_replayssm_spec",
-        "speculative_algorithm",
-        "speculative_eagle_topk",
-        "speculative_num_steps",
-        "speculative_num_draft_tokens",
-        "linear_attn_backend",
-        "linear_attn_decode_backend",
-        "linear_attn_verify_backend",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
         "watchdog_timeout",
@@ -102,7 +89,6 @@ SGLANG_READS = {
         "SGLANG_SIMULATE_UNIFORM_EXPERTS",
         "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
         "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK",
-        "SGLANG_ENABLE_PP_SPEC",
     ),
     "srt/configs/model_config.py": ("context_len",),
     "srt/distributed/parallel_state.py": ("cpu_group",),
@@ -120,8 +106,6 @@ SGLANG_READS = {
         "state_layer_cache",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
-    # fused accept: the verify kernel seeds from the accepted step, not the state
-    "srt/layers/attention/linear/kda_backend.py": ("accept_lens_pool",),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("maybe_input_scattered",),
     "srt/layers/layer_boundary/residual/batch.py": ("start", "clear"),
@@ -141,8 +125,6 @@ SGLANG_READS = {
     "srt/mem_cache/memory_pool.py": (
         "conv",
         "temporal",
-        "intermediate_ssm",
-        "intermediate_conv_window",
         "get_key_buffer",
         "get_index_k_with_scale_buffer",
         "get_compress_tail_buffers",
@@ -151,9 +133,6 @@ SGLANG_READS = {
         "out_cache_loc",
         "req_pool_indices",
         "capture_hidden_mode",
-    ),
-    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
-    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
         "need_capture",
     ),
     "srt/model_executor/forward_context.py": (
@@ -181,18 +160,13 @@ SGLANG_READS = {
         "Numerics",
         "NumericsKind",
         "Requirements",
-        "Feature",
         "widths",
         "deadline_s",
         "copies",
-        "tokens_per_request",
     ),
-    # NEXTN resolves to EAGLE
-    "srt/arg_groups/speculative_hook.py": ('"EAGLE"', '"NEXTN"'),
     "srt/runtime_context.py": (
         "get_device",
         "get_parallel",
-        "get_spec",
         "process_model_config",
         '"tp_rank"',
         '"tp_size"',
@@ -283,24 +257,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     if cfg.page_size not in (None, PAGE_SIZE):
         reasons.append(
             f"--page-size {cfg.page_size}: the kpool caches need {PAGE_SIZE}"
-        )
-    # a verify request's rows are one draft chain, each row the next position
-    if cfg.speculative_algorithm is not None and (
-        cfg.speculative_eagle_topk != 1
-        or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
-    ):
-        reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
-    # SGLang's FlashInfer KDA verify fuses the accept (KDAAttnBackend's
-    # _can_fuse_accept_state): it skips the KDA state commit, which a verify
-    # launch reads. Unset, the verify backend follows a FlashInfer decode backend
-    decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
-    verify = cfg.linear_attn_verify_backend or (
-        "flashinfer" if decode == "flashinfer" else None
-    )
-    if cfg.speculative_algorithm is not None and verify == "flashinfer":
-        reasons.append(
-            "MTP with the FlashInfer KDA verify backend fuses the accept, leaving "
-            "the KDA state a verify launch reads uncommitted"
         )
     if not aiter_can_use_preshuffle_paged_mqa():
         reasons.append(
@@ -396,17 +352,6 @@ def normed_rows(lm, owed: _Owed, S: int) -> torch.Tensor:
     return lm.model.norm(check.contract(written))
 
 
-def check_verify_page_table(page_table: torch.Tensor, verify: int) -> None:
-    """Refuse a verify step whose rows of one request differ in ``page_table``: the
-    sparse-attention launch scores a request's keys once, from its first row."""
-    rows = page_table.reshape(-1, verify, page_table.shape[-1])
-    if not torch.equal(rows, rows[:, :1].expand_as(rows)):
-        raise RuntimeError(
-            "GLM-5.3-Flash monokernel: the DSA backend's page table no longer repeats "
-            "a verify request's row for each of its rows"
-        )
-
-
 def _written(module, x, residual, post, comb) -> torch.Tensor:
     """The streams with the owed FFN post applied, as SGLang's FFN exit writes them."""
     s = x.shape[0]
@@ -430,17 +375,7 @@ class _Built:
     """One rank's monokernels: the runtimes per (width, kind), each layer's ops, the
     tail's ops, and the forward."""
 
-    def __init__(
-        self,
-        lm,
-        layers: dict,
-        runtimes: dict,
-        heads: dict,
-        tp: int,
-        device,
-        verify: int = 1,
-        max_position: int = 0,
-    ):
+    def __init__(self, lm, layers: dict, runtimes: dict, heads: dict, tp: int, device):
         from sgl_amd_mono.glm53_flash.gfx950.config import (
             HC_MULT,
             HIDDEN,
@@ -454,12 +389,7 @@ class _Built:
         self._layers, self.runtimes, self.heads = layers, runtimes, heads
         self.last = max(layers)
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
-        # a step's rows a request: the verify step's draft tokens with MTP, else 1
-        self.verify, self.max_position = verify, max_position
-        # the launch checks run SGLang's decode layer: decode steps only
-        self.check_layers = (
-            os.environ.get("SGLANG_AMD_MONO_CHECK") == "1" and verify == 1
-        )
+        self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         # layer 0's input besides its tokens: every stream a copy of the embedding row
         # (x = the row, post 1, comb 0, residual 0)
         n = max(WIDTHS)
@@ -479,11 +409,6 @@ class _Built:
             rows[:, ROW_BT] = 0
             self.rows[w] = rows
             self.kda_idx[w] = torch.zeros(w, dtype=torch.int32, device=device)
-        # a verify step's positions and request rows, made per row: a graph's step
-        # table holds their addresses, so they are an eager step's
-        self.verify_in = {
-            w: torch.zeros(2, w, dtype=torch.int64, device=device) for w, _ in runtimes
-        }
         # the logits processor returns the tail's logits on a routed step
         lp = lm.logits_processor
         self._own_logits, self._logits = lp._get_logits, None
@@ -507,14 +432,9 @@ class _Built:
         input_embeds=None,
         pp_proxy_tensors=None,
     ):
-        """``Glm5NextForConditionalGeneration.forward`` for a routed decode or MTP
-        verify step (a verify step's rows are its requests' draft chains)."""
+        """``Glm5NextForConditionalGeneration.forward`` for a routed decode step."""
         lm = self.lm
-        if (
-            plan.key.rows > self.max_rows
-            or plan.key.tokens_per_request != self.verify
-            or input_embeds is not None
-        ):
+        if plan.key.rows > self.max_rows or input_embeds is not None:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
@@ -574,12 +494,7 @@ class _Built:
         W = _width(S)
         checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         backend = get_attn_backend()
-        V = self.verify
-        # the KDA state indices and request rows are a request's (a verify step:
-        # bs of them), the launches' a row's
-        slots = backend.linear_attn_backend.forward_metadata.mamba_cache_indices[
-            : S // V
-        ]
+        slots = backend.linear_attn_backend.forward_metadata.mamba_cache_indices[:S]
         op = L.ops[W]
         if L.i == 0:
             ins = (
@@ -588,33 +503,14 @@ class _Built:
                 self.one_post[:W],
                 self.zero_comb[:W],
             )
-            rpi = forward_batch.req_pool_indices[: S // V]
-            pos = positions[:S]
-            if V > 1:
-                if backend.linear_attn_backend.accept_lens_pool is not None:
-                    raise RuntimeError(
-                        "GLM-5.3-Flash monokernel: a verify launch reads the committed "
-                        "KDA state, not the fused accept's"
-                    )
-                slots = slots.repeat_interleave(V)
-                buf = self.verify_in[W]
-                # verify rows past the context are lookahead the scheduler
-                # discards; a row's pools end at the context's
-                buf[0, :S].copy_(pos.clamp(max=self.max_position))
-                buf[1, :S].copy_(rpi.repeat_interleave(V))
-                pos, rpi = buf[0, :S], buf[1, :S]
             idx = slots if slots.dtype == torch.int32 else slots.int()
             page_table = backend.full_attn_backend.forward_metadata.real_page_table
-            # the DSA backend repeats a verify request's page-table row for each row;
-            # an eager step checks it (a graph replays without the host)
-            if V > 1 and not torch.cuda.is_current_stream_capturing():
-                check_verify_page_table(page_table[:S], V)
             plan.state["dsa_rows"] = (self.rows[W], page_table[:S])
             step = {
                 "ids": input_ids[:S],
-                "positions": pos,
+                "positions": positions[:S],
                 "out_cache_loc": forward_batch.out_cache_loc[:S],
-                "req_pool_indices": rpi,
+                "req_pool_indices": forward_batch.req_pool_indices[:S],
                 "slots": self.kda_idx[W],
                 "rows": self.rows[W],
             }
@@ -628,15 +524,13 @@ class _Built:
             hidden = self.model.embed_tokens(input_ids[:S]) if L.i == 0 else streams
             ref = check.reference(L, positions, hidden, forward_batch, S, idx[:S])
         if L.kda:
-            self._bind_kda(L, backend.linear_attn_backend, V)
+            self._bind_kda(L, backend.linear_attn_backend)
             out = op.launch(*ins, state=L.state, state_idx=idx, step=step)
-            # a verify step's states are committed after it, with their radix copy
-            if V == 1:
-                backend.linear_attn_backend._track_mamba_state_decode(
-                    forward_batch, L.state.conv_state, L.state.rec_state, slots, L.i
-                )
+            backend.linear_attn_backend._track_mamba_state_decode(
+                forward_batch, L.state.conv_state, L.state.rec_state, slots, L.i
+            )
         else:
-            self._bind_dsa(L, V)
+            self._bind_dsa(L)
             rows, page_table = plan.state["dsa_rows"]
             out = op.launch(*ins, caches=L.caches, rows=rows, page_table=page_table)
         if checking:
@@ -647,31 +541,16 @@ class _Built:
         return _Owed(*out)
 
     @staticmethod
-    def _bind_kda(L: _Layer, kda, verify: int) -> None:
-        """The layer's KDA state, and with MTP (``verify`` rows a request) its
-        verify scratch."""
+    def _bind_kda(L: _Layer, kda) -> None:
         from sgl_amd_mono.glm53_flash.gfx950.runner import (
             FlashKdaState,
         )
 
         cache = kda.state_layer_cache(L.i)
         conv, rec = cache.conv[0], cache.temporal
-        ir = ic = None
-        if verify > 1:
-            ir, ic = cache.intermediate_ssm, cache.intermediate_conv_window[0]
-        bound = (conv, rec, ir, ic)
-        if L.state is not None and all(
-            (a is None and b is None)
-            or (a is not None and b is not None and a.data_ptr() == b.data_ptr())
-            for a, b in zip(
-                (
-                    L.state.conv_state,
-                    L.state.rec_state,
-                    L.state.inter_rec,
-                    L.state.inter_conv,
-                ),
-                bound,
-            )
+        if L.state is not None and (
+            L.state.conv_state.data_ptr() == conv.data_ptr()
+            and L.state.rec_state.data_ptr() == rec.data_ptr()
         ):
             return
         P3, H, D = L.attn.conv_w.shape[0], L.attn.a_log.shape[0], 128
@@ -690,28 +569,10 @@ class _Built:
                 f"{rec.dtype} {tuple(rec.shape)} {rec.stride()}; needs bf16 "
                 f"[slots, 3, {P3}] and f32 [slots, {H}, {D}, {D}]"
             )
-        if verify > 1 and not (
-            ir is not None
-            and ir.dtype == torch.float32
-            and tuple(ir.shape[1:]) == (verify, H, D, D)
-            and ir.stride()[1:] == (H * D * D, D * D, D, 1)
-            and ic.dtype == torch.bfloat16
-            and tuple(ic.shape[1:]) == (verify, 3, P3)
-            and ic.stride()[1:] == (3 * P3, P3, 1)
-        ):
-            raise RuntimeError(
-                f"GLM-5.3-Flash monokernel: layer {L.i}: KDA verify scratch "
-                f"{None if ir is None else (ir.dtype, tuple(ir.shape), ir.stride())}, "
-                f"conv window {ic.dtype} {tuple(ic.shape)} {ic.stride()}; needs f32 "
-                f"[rows, {verify}, {H}, {D}, {D}] and dense bf16 "
-                f"[rows, {verify}, 3, {P3}]"
-            )
-        L.state = FlashKdaState(
-            conv_state=conv, rec_state=rec, inter_rec=ir, inter_conv=ic
-        )
+        L.state = FlashKdaState(conv_state=conv, rec_state=rec)
 
     @staticmethod
-    def _bind_dsa(L: _Layer, verify: int) -> None:
+    def _bind_dsa(L: _Layer) -> None:
         from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
         from sgl_amd_mono.glm53_flash.gfx950.runner import (
@@ -753,21 +614,15 @@ class _Built:
                 f"index cache {idx.dtype} {tuple(idx.shape)}, needs contiguous uint8 "
                 f"[pages, {INDEX_BLOCK_POOLS * 132}]"
             )
-        # SGLang's ring: 4 slots a request, plus a verify step's draft tokens; a
-        # verify chain's pool reads the 3 slots before its row, after the chain's
-        # earlier rows wrote theirs
-        ring = 4 if verify == 1 else verify + 3
         for name, t in (("k", tail_k), ("gate", tail_g)):
             if (
                 t.dtype != torch.bfloat16
-                or t.dim() != 3
-                or t.shape[1] < ring
-                or t.shape[2] != 128
+                or tuple(t.shape[1:]) != (4, 128)
                 or not t.is_contiguous()
             ):
                 reasons.append(
                     f"kpool {name} ring {t.dtype} {tuple(t.shape)}, needs contiguous "
-                    f"bf16 [slots, >= {ring}, 128]"
+                    "bf16 [slots, 4, 128]"
                 )
         if reasons:
             raise RuntimeError(
@@ -788,7 +643,7 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    from sglang.srt.runtime_context import get_parallel, get_spec, process_model_config
+    from sglang.srt.runtime_context import get_parallel, process_model_config
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.glm53_flash.gfx950.config import (
@@ -865,16 +720,8 @@ def _build(model, hf_config, ctx) -> _Built:
     fault_site, fault_after = guard.fault_injection(rank) or (0, 0)
     # the pools a sparse-attention row scores at most: the served context's, whole
     # score tasks of 256 pools
-    context_len = process_model_config().context_len
-    pools = -(-context_len // KPOOL)
+    pools = -(-process_model_config().context_len // KPOOL)
     max_pools = -(-pools // POOLS_PER_TASK) * POOLS_PER_TASK
-    # MTP: the target's verify steps, a draft chain of draft-tokens rows a request
-    sp = get_spec()
-    verify = (
-        int(sp.speculative_num_draft_tokens)
-        if sp.speculative_algorithm is not None
-        else 1
-    )
     runtimes, heads = {}, {}
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
@@ -914,8 +761,6 @@ def _build(model, hf_config, ctx) -> _Built:
                 dense=kind in ("dense", "embed"),
                 dense_shuffled=dense_sh if kind in ("dense", "embed") else False,
                 tokens=kind == "embed",
-                verify=verify,
-                grouped=w >= GROUPED_FROM and kind not in ("dense", "embed"),
                 fault_site=fault_site,
                 fault_after=fault_after,
             )
@@ -948,7 +793,7 @@ def _build(model, hf_config, ctx) -> _Built:
         for (rw, _), rt in runtimes.items():
             if rw == w:
                 rt.precompile()
-    return _Built(model, layers, runtimes, heads, tp, device, verify, context_len - 1)
+    return _Built(model, layers, runtimes, heads, tp, device)
 
 
 SPEC = MonoSpec(
@@ -956,9 +801,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(widths=ROWS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
     },
-    # decode steps, or the target's verify steps of MTP (the NextN draft runs
-    # SGLang's forward)
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    features=frozenset(),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),
@@ -967,11 +810,6 @@ SPEC = MonoSpec(
             "moe_runner_backend": frozenset({"auto", "aiter"}),
             # the launch updates the KDA state in place; ReplaySSM defers it to a ring
             "enable_linear_replayssm": frozenset({False}),
-            # MTP: the NextN draft's verify steps (NEXTN resolves to EAGLE); a verify
-            # launch writes every draft token's KDA state to the verify scratch,
-            # which ReplaySSM's spec mode does not keep
-            "speculative_algorithm": frozenset({None, "EAGLE"}),
-            "enable_linear_replayssm_spec": frozenset({False}),
             # HiSparse maps the logical KV slots to device rows; the kernels write raw slots
             "enable_hisparse": frozenset({False}),
             # the launches record no expert distribution, and layer 44 would record
@@ -985,9 +823,6 @@ SPEC = MonoSpec(
             # the kernel breaks router ties in AITER's grouped top-k order, the path
             # SGLang takes with this off; on, its Triton gate keeps the lower expert id
             "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK": False,
-            # PP spec remaps the verify scratch rows; a verify launch writes request
-            # r's to row r
-            "SGLANG_ENABLE_PP_SPEC": False,
         },
     ),
     numerics=NUMERICS,

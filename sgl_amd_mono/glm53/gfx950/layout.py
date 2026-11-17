@@ -37,23 +37,6 @@ HEAD_TILE = 16
 # the NextN entry's pointer-table entries: this rank's eh_proj rows, the enorm and
 # hnorm weights, and (from the tokens) this rank's embedding rows
 EH_ARGS = (8, 9, 10, 11)
-
-
-def eh_parts(eh_tiles: int) -> int:
-    """The NextN entry's K parts a tile: four (two of each of the e and h_prev halves)
-    when their tasks fit one round of CTAs, else the two halves."""
-    return 4 if 4 * eh_tiles <= BLOCKS else 2
-
-
-def eh_base(eh_tiles: int, with_indexer: bool) -> int:
-    """The NextN entry's first CTA. With the indexer, the CTA past the front's index
-    projection tiles, which are the grid's last CTAs, so CTA 0: those tiles' weights go
-    out at the launch start, not behind an entry task. Else the last CTAs."""
-    if with_indexer:
-        return 0
-    return max(BLOCKS - eh_parts(eh_tiles) * eh_tiles, 0)
-
-
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
@@ -102,10 +85,6 @@ def fp8_pe_upper_pair_lane(lane):
 
 
 N_QKV_A = QKV_A_ROWS // QKV_A_TILE
-# the front splits each q_a / kv_a tile's K: the first FRONT_K_BIG on the tile's own CTA,
-# the rest on one of the FRONT_SMALL_CTAS CTAs past them (two tiles' rests a CTA)
-FRONT_K_BIG = 4096
-FRONT_SMALL_CTAS = BLOCKS - N_QKV_A
 N_ROW_TILES = HIDDEN // ROW_TILE
 N_ROUTER = N_EXPERTS // ROUTER_TILE
 XQ_BLOCKS = HIDDEN // 128
@@ -198,8 +177,8 @@ def layout(
     ``tokens``: also the layer input's rows, which the token's owner rank pushes
     (``xin``, two slots by launch parity). ``eh_tiles``: the NextN entry's rows of
     ``xin`` instead, which every rank pushes its ``eh_tiles`` 16-column tiles of, and
-    the partial sums of every K part but a tile's first (``ehp``); with ``tokens``
-    the embedding rows go to ``ein`` (as ``xin``). ``head_vocab``: the tail launch's
+    the h_prev halves' partial sums (``ehp``); with ``tokens`` the embedding rows go
+    to ``ein`` (as ``xin``). ``head_vocab``: the tail launch's
     buffers instead, the gathered bf16 logits of a ``head_vocab`` vocabulary (two
     slots)."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
@@ -217,8 +196,6 @@ def layout(
     pair_bytes = 8
     items = [
         ("q_a", samples * Q_LORA * pair_bytes),
-        ("q_a2", samples * Q_LORA * pair_bytes),
-        ("kv_a2", samples * (KV_LORA + PE_DIM) * pair_bytes),
         ("q_an", samples * Q_LORA // 2 * pair_bytes),
         ("kv_a", samples * (KV_LORA + PE_DIM) * pair_bytes),
         ("kvnew", samples * KV_LORA * pair_bytes),
@@ -240,9 +217,6 @@ def layout(
         ("sel", samples * MOE_SLOTS * pair_bytes),
         ("prob", samples * MOE_SLOTS * pair_bytes),
         ("mid", samples * MOE_SLOTS * inter * pair_bytes),
-        # mid's FP8 blocks (four values a pair) and their scales
-        ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
-        ("midqs", samples * MOE_SLOTS * inter // 128 * pair_bytes),
         ("ugp", BLOCKS * samples * 2 * UG_TILE * pair_bytes),
         ("xqd", samples * HIDDEN * 4),
     ]
@@ -263,17 +237,9 @@ def layout(
                 samples * INDEX_SEL_DIGITS * INDEX_SEL_SLICES * 32 * pair_bytes,
             ),
             ("sel_cand", samples * INDEX_CAND_STAGE_CAP * 2 * pair_bytes),
-            # per row and scoring run, its two slice segments' first-digit counts (64
-            # bins each, two a pair)
-            ("score_hist", samples * BLOCKS * 64 * pair_bytes),
         ]
     if eh_tiles:
-        items += [
-            (
-                "ehp",
-                (eh_parts(eh_tiles) - 1) * eh_tiles * samples * HEAD_TILE * pair_bytes,
-            )
-        ]
+        items += [("ehp", eh_tiles * samples * HEAD_TILE * pair_bytes)]
 
     offset, scratch = 0, {}
     for name, size in items:
@@ -322,17 +288,19 @@ def stage_tasks(
 ):
     """Return ``(stage name, task count)`` pairs in execution order; with ``tokens``
     led by the embedding rows' push, with ``eh_tiles`` by the NextN entry (each tile's
-    K parts, ``eh_parts``). With ``head_rows`` (this rank's LM-head rows) the tail's
+    e and h_prev halves). With ``head_rows`` (this rank's LM-head rows) the tail's
     instead."""
 
     if head_rows:
         return [("lmhead", head_rows // HEAD_TILE), ("gather", BLOCKS)]
     tasks = [("embed", N_ROW_TILES)] if tokens else []
-    tasks += [("eh", eh_parts(eh_tiles) * eh_tiles)] if eh_tiles else []
+    tasks += [("eh", 2 * eh_tiles)] if eh_tiles else []
     tasks += [
-        # every CTA: a tile's K head, two tiles' K rests or, with the indexer, an index
-        # K or weights projection tile
-        ("qkv_a", BLOCKS),
+        # with the indexer, the index K and weights projections' 16-row tiles follow
+        (
+            "qkv_a",
+            N_QKV_A + ((INDEX_DIM + INDEX_HEADS) // QKV_A_TILE if with_indexer else 0),
+        ),
         ("q_norm", samples),
         ("cache", samples),
     ]
@@ -374,12 +342,6 @@ def stage_tasks(
                     BLOCKS,
                     ((MOE_SLOTS * inter // UG_TILE + BLOCKS - 1) // BLOCKS) * BLOCKS,
                 )
-                if samples <= 4
-                # above 4 rows: rounds of 8-intermediate tiles of the shared expert
-                # and of up to every row's routed experts
-                else ((samples * TOP_K + 1) * (inter // 8) + BLOCKS - 1)
-                // BLOCKS
-                * BLOCKS
             ),
         ),
         ("down", HIDDEN // dn_tile(samples, expert_mxfp4)),
@@ -411,23 +373,30 @@ def stage_bases(
         )
     )
     base, acc = {}, 0
-    # the front takes every CTA (a tile's K head, or two tiles' K rests); q_norm (with
-    # each row's cache task) and q_b follow on the first CTAs, split past q_b's (its
-    # last few on the q_norm CTAs); the cache keeps one CTA of the sequence after
-    # split, so uk (on the q_b CTAs it waits on anyway) and uv keep their CTAs
-    for name in ("qkv_a", "q_norm", "q_b", "split", "cache", "uk", "uv"):
+    # q_norm (with each row's cache task) on the first CTAs past qkv_a's, so it polls
+    # from the launch start; q_b after it. split from the CTA past q_b's, so its tiles
+    # land on CTAs freed by qkv_a, the last few on the q_norm CTAs; the cache keeps one
+    # CTA of the sequence after split, so uk (on the q_b CTAs it waits on anyway) and
+    # the later stages keep their CTAs.
+    for name in (
+        "qkv_a",
+        "q_norm",
+        "q_b",
+        "split",
+        "cache",
+        "uk",
+        "uv",
+        "o",
+        "router",
+        "ug",
+        "down",
+    ):
         base[name] = acc % BLOCKS
         acc += 1 if name == "cache" else tasks[name]
     base["cache"] = base["q_norm"]
     # o from split's first CTA: its tasks fill the split CTAs, free once the
     # attention ends
     base["o"] = base["split"]
-    # the MoE stages keep the CTAs of a front of whole tiles
-    acc = N_QKV_A + ((INDEX_DIM + INDEX_HEADS) // QKV_A_TILE if with_indexer else 0)
-    for name in ("q_norm", "q_b", "split", "uk", "uv", "o", "router", "ug", "down"):
-        if name in ("router", "ug", "down"):
-            base[name] = acc % BLOCKS
-        acc += tasks[name] + (1 if name == "split" else 0)
     if with_indexer:
         # q_b occupies exactly half the grid.  Put the second half of index-Q on
         # the complementary CTAs while q_b CTAs reuse their normalized q_lora

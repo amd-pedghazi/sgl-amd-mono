@@ -146,15 +146,10 @@ class FlashDsaCaches(msgspec.Struct, frozen=True):
 
 class FlashKdaState(msgspec.Struct, frozen=True):
     """One KDA layer's decode state: bf16 conv state [slots, 3, 3P] and f32
-    recurrent state [slots, H, 128 (v), 128 (k)], slot strides in elements. A verify
-    launch also writes SGLang's verify scratch: the f32 recurrent state
-    [rows, steps, H, 128, 128] and the bf16 conv window [rows, steps, 3, 3P] after
-    each draft token (a scratch row a request, its batch position)."""
+    recurrent state [slots, H, 128 (v), 128 (k)], slot strides in elements."""
 
     conv_state: torch.Tensor
     rec_state: torch.Tensor
-    inter_rec: Optional[torch.Tensor] = None
-    inter_conv: Optional[torch.Tensor] = None
 
 
 # Rows of SGLang's DSA page table an index block spans: an index page holds 64
@@ -162,9 +157,6 @@ class FlashKdaState(msgspec.Struct, frozen=True):
 PAGE_TOKENS = 64
 INDEX_BLOCK_POOLS = 64
 IDX_BT_GROUP = INDEX_BLOCK_POOLS * KPOOL // PAGE_TOKENS
-# the KDA launch arguments: the attention-side mHC and KDA weights, the state
-# and its indices and strides, the verify scratch and its strides
-KDA_ARGS = 21
 
 
 def compile_only(launch) -> None:
@@ -437,7 +429,7 @@ class FlashLayerOp:
         _check("comb", comb, (S, HC_MULT, HC_MULT), torch.float32)
         x_out, res_out, post_out, comb_out = rt.outs[self.layer % 2]
         p = lambda t: t.data_ptr()  # noqa: E731
-        kda_args = [0] * KDA_ARGS
+        kda_args = [0] * 17
         dsa_args = [0, 0, 0, 0]
         if self.dsa is not None:
             if caches is None or rows is None or page_table is None:
@@ -464,12 +456,6 @@ class FlashLayerOp:
             n = step["ids"].shape[0] if self.embedding is not None else S
             _check("state_idx", state_idx, (n,), torch.int32)
             k = self.kda
-            inter = [0, 0, 0, 0]
-            if self.rt.key.verify > 1:
-                ir, ic = state.inter_rec, state.inter_conv
-                if ir is None or ic is None:
-                    raise ValueError("a verify launch needs the verify scratch")
-                inter = [p(ir), p(ic), ir.stride(0), ic.stride(0)]
             kda_args = [
                 *map(p, (k.hc_fn, k.hc_scale, k.hc_base, k.g_norm, k.w_in, k.w_fb)),
                 *map(p, (k.w_gb, k.conv_w, k.a_log, k.dt_bias, k.w_on, k.w_o)),
@@ -478,7 +464,6 @@ class FlashLayerOp:
                 p(state_idx),
                 state.conv_state.stride(0),
                 state.rec_state.stride(0),
-                *inter,
             ]
         if self.embedding is not None:
             dsa_args = [p(self._step_table(step)), 0, 0, 0]
@@ -552,7 +537,7 @@ class FlashHeadOp:
             p(rt.logits),
             p(w.w_head),
             *[0] * 9,
-            *[0] * KDA_ARGS,
+            *[0] * 17,
             *[0] * 4,
             p(rt.scratch),
             rt.peer.local,
