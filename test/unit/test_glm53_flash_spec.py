@@ -1,9 +1,8 @@
 """The GLM-5.3-Flash gfx950 monokernel spec on CPU (RFC #43949): the layers its
 forward covers on the GLM-5.3-Flash layer structure, its row routing and TP2 row
-cap, its verify page-table check, the tail's logits in place of the logits
-processor's, its registry entry, its config and model refusal reasons, and the
-dense, embedding and LM-head views. SGLang checks its declared requirements, the
-same way for every spec."""
+cap, the tail's logits in place of the logits processor's, its registry entry, its
+config and model refusal reasons, and the dense, embedding and LM-head views. SGLang
+checks its declared requirements, the same way for every spec."""
 
 import math
 from types import SimpleNamespace
@@ -77,29 +76,24 @@ class _Lm:
         return "the model's forward"
 
 
-def _built(tp=4, widths=(2, 4, 8), verify=1):
+def _built(tp=4, widths=(2, 4, 8)):
     lm = _Lm()
     kinds = ("embed", "dense", "kda", "dsa", "head")
     runtimes = {(w, k): None for w in widths for k in kinds}
     layers = {i: SimpleNamespace(i=i) for i in range(45)}
-    built = flash._Built(lm, layers, runtimes, {}, tp=tp, device="cpu", verify=verify)
-    return lm, built
+    return lm, flash._Built(lm, layers, runtimes, {}, tp=tp, device="cpu")
 
 
-def _plan(rows, tokens=1):
+def _plan(rows):
     key = registry.ShapeKey(
-        forward_mode="decode" if tokens == 1 else "target_verify",
-        batch_size=rows // tokens,
-        tokens_per_request=tokens,
+        forward_mode="decode", batch_size=rows, tokens_per_request=1
     )
     return registry.Plan(key=key)
 
 
 def test_a_step_runs_at_the_next_width_and_tp2_takes_four_rows():
     # a step of fewer rows than a width runs at the next width, the rest pad rows
-    assert [flash._width(r) for r in flash.ROWS] == [2, 2, 4, 4] + [8] * 4 + [
-        12
-    ] * 4 + [16] * 4
+    assert [flash._width(r) for r in flash.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
     # TP2 builds no 8-row launch: a wider step runs the model's own forward
     lm, built = _built(tp=2, widths=(2, 4))
     out = built.forward(_plan(8), "ids", "positions", "batch")
@@ -110,27 +104,6 @@ def test_a_step_runs_at_the_next_width_and_tp2_takes_four_rows():
     assert (built.one_post == 1).all() and not built.zero_comb.any()
     # the width's rows past the step's read page-table row 0 until layer 0 writes them
     assert set(built.rows) == {2, 4} and (built.rows[4][:, 4] == 0).all()
-
-
-def test_a_verify_step_of_other_draft_chains_runs_the_model_s_forward():
-    # the launches are built for one draft-chain length (the server's draft tokens)
-    lm, built = _built(verify=4)
-    out = built.forward(_plan(8, tokens=2), "ids", "positions", "batch")
-    assert out == "the model's forward" and len(lm.ran) == 1
-    # TP2: a verify step past 4 rows runs the model's forward too
-    lm, built = _built(tp=2, widths=(2, 4), verify=4)
-    out = built.forward(_plan(8, tokens=4), "ids", "positions", "batch")
-    assert out == "the model's forward" and len(lm.ran) == 1
-
-
-def test_a_verify_step_refuses_a_page_table_that_does_not_repeat_its_rows():
-    # the DSA backend's verify page table: 3 requests, each row repeated for its 4 rows
-    page_table = torch.arange(3 * 5, dtype=torch.int32).reshape(3, 5)
-    page_table = page_table.repeat_interleave(4, dim=0)
-    flash.check_verify_page_table(page_table, 4)
-    page_table[5, 2] += 1
-    with pytest.raises(RuntimeError, match="no longer repeats"):
-        flash.check_verify_page_table(page_table, 4)
 
 
 def test_a_step_from_embeddings_runs_the_model_s_forward():
@@ -151,16 +124,7 @@ def test_the_logits_processor_returns_the_tail_s_logits_on_a_routed_step():
 
 
 def _cfg(**kw):
-    return SimpleNamespace(
-        **{
-            "page_size": 256,
-            "speculative_algorithm": None,
-            "linear_attn_backend": "triton",
-            "linear_attn_decode_backend": None,
-            "linear_attn_verify_backend": None,
-            **kw,
-        }
-    )
+    return SimpleNamespace(**{"page_size": 256, **kw})
 
 
 def _dtypes(temporal=torch.float32, conv=torch.bfloat16):
@@ -212,71 +176,45 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
     assert len(reasons) == 7, reasons
 
 
-@pytest.mark.parametrize(
-    "topk, steps, draft, ok",
-    [(1, 3, 4, True), (1, 5, 6, True), (4, 3, 8, False), (1, 3, 3, False)],
-)
-def test_mtp_verifies_one_draft_chain(monkeypatch, topk, steps, draft, ok):
-    # a verify request's rows are one chain of draft tokens, each the next position
-    import sglang.srt.configs.mamba_utils as mamba_utils
-    import sglang.srt.layers.attention.dsa.utils as dsa_utils
+class _ServerArgs(SimpleNamespace):
+    """Server arguments as SGLang's startup check reads them: the given ones, every
+    other feature off."""
 
-    monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
-    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
-    cfg = _cfg(
-        speculative_algorithm="EAGLE",
-        speculative_eagle_topk=topk,
-        speculative_num_steps=steps,
-        speculative_num_draft_tokens=draft,
-    )
-    reasons = flash.SPEC.config_disable_reasons(cfg, FLASH)
-    assert (reasons == []) == ok, reasons
+    def __getattr__(self, name):
+        return 0 if name.endswith(("_size", "_gb", "nnodes")) else None
 
 
-@pytest.mark.parametrize(
-    "spec, backends, ok",
-    [
-        ("EAGLE", {}, True),
-        ("EAGLE", {"linear_attn_verify_backend": "triton"}, True),
-        ("EAGLE", {"linear_attn_verify_backend": "flashinfer"}, False),
-        ("EAGLE", {"linear_attn_decode_backend": "flashinfer"}, False),
-        ("EAGLE", {"linear_attn_backend": "flashinfer"}, False),
-        (
-            "EAGLE",
-            {
-                "linear_attn_decode_backend": "flashinfer",
-                "linear_attn_verify_backend": "triton",
-            },
-            True,
-        ),
-        (None, {"linear_attn_backend": "flashinfer"}, True),
-    ],
-)
-def test_mtp_refuses_the_fused_accept(monkeypatch, spec, backends, ok):
-    # SGLang's FlashInfer KDA verify skips the KDA state commit a verify launch
-    # reads; unset, the verify backend follows a FlashInfer decode backend
-    import sglang.srt.configs.mamba_utils as mamba_utils
-    import sglang.srt.layers.attention.dsa.utils as dsa_utils
-
-    monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
-    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
-    cfg = _cfg(
-        speculative_algorithm=spec,
-        speculative_eagle_topk=1,
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
-        **backends,
-    )
-    reasons = flash.SPEC.config_disable_reasons(cfg, FLASH)
-    assert (reasons == []) == ok, reasons
-    assert ok or "fuses the accept" in reasons[0], reasons
-
-
-def test_the_spec_requires_sglang_jit_grouped_topk_off():
+def test_sglang_refuses_its_jit_grouped_topk(monkeypatch):
     # the kernel's router ties follow AITER's grouped top-k; SGLang's JIT grouped
-    # top-k (a Triton gate) keeps the lower expert id, so the spec requires it off
-    # (SGLang refuses a setup against a spec's declared env)
-    assert flash.SPEC.requires.env["SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK"] is False
+    # top-k (a Triton gate) keeps the lower expert id, so the spec requires it off,
+    # and SGLang's startup check refuses the setup when it is on
+    import sglang.srt.configs.mamba_utils as mamba_utils
+    import sglang.srt.layers.attention.dsa.utils as dsa_utils
+
+    try:
+        from sglang.srt.kernel_plugins.amd.binding import monokernel_disable_reasons
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels.guards import monokernel_disable_reasons
+
+    monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
+    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
+    sgl_amd_mono.register_specs()
+    name = "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK"
+    assert flash.SPEC.requires.env[name] is False
+    cfg = _ServerArgs(monokernel_backend=sgl_amd_mono.BACKEND, tp_size=4, page_size=256)
+    model_config = SimpleNamespace(hf_config=FLASH, dtype=torch.bfloat16)
+
+    def reasons():
+        spec, why = monokernel_disable_reasons(
+            cfg=cfg, model_config=model_config, isa="gfx950"
+        )
+        assert spec is flash.SPEC
+        return set(why)
+
+    monkeypatch.delenv(name, raising=False)
+    off = reasons()
+    monkeypatch.setenv(name, "1")
+    assert reasons() - off == {f"{name} True is not False"}
 
 
 def _layer(kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True):
@@ -628,10 +566,8 @@ def _routed_step(monkeypatch, capture=None):
     lm.model = SimpleNamespace(layers=[last], norm=lambda h: h * 2)
     monkeypatch.setattr(check, "contract", lambda streams: streams)
     built = flash._Built(lm, layers, runtimes, {2: _Head(calls)}, tp=4, device="cpu")
-    monkeypatch.setattr(
-        flash._Built, "_bind_kda", staticmethod(lambda L, kda, verify: None)
-    )
-    monkeypatch.setattr(flash._Built, "_bind_dsa", staticmethod(lambda L, verify: None))
+    monkeypatch.setattr(flash._Built, "_bind_kda", staticmethod(lambda L: None))
+    monkeypatch.setattr(flash._Built, "_bind_dsa", staticmethod(lambda L: None))
     slots = torch.tensor([5], dtype=torch.int32)
     linear = SimpleNamespace(
         forward_metadata=SimpleNamespace(mamba_cache_indices=slots),

@@ -10,24 +10,16 @@ checked in ``config_disable_reasons`` as SGLang checks a spec's.
 
 from __future__ import annotations
 
-try:
-    from sglang.kernels.plugin_kernels.amd.spec import MonoSpec, Requirements
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.monokernels.spec import MonoSpec, Requirements
+from sglang.srt.monokernels.spec import MonoSpec, Requirements
 
 from sgl_amd_mono.minimax_m3 import spec as m3
 from sgl_amd_mono.minimax_m31 import spec as m31
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
-        "MonoSpec",
-        "Requirements",
-    ),
-    "srt/kernel_plugins/amd/binding.py|srt/monokernels/guards.py": ("features_in_use",),
-    "srt/arg_groups/model_override_base.py|srt/arg_groups/overrides.py": (
-        "attention_backends_of",
-    ),
+    "srt/monokernels/spec.py": ("MonoSpec", "Requirements"),
+    "srt/monokernels/guards.py": ("features_in_use",),
+    "srt/arg_groups/overrides.py": ("attention_backends_of",),
     "srt/environ.py": ("envs",),
 }
 
@@ -35,14 +27,9 @@ SGLANG_READS = {
 def _requirement_reasons(spec: MonoSpec, cfg, hf_config) -> list[str]:
     """``spec``'s requirements and features, as SGLang's monokernel guard checks them
     (``monokernel_disable_reasons``); dtype and TP are this spec's."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
     from sglang.srt.environ import envs
-
-    try:
-        from sglang.srt.arg_groups.model_override_base import attention_backends_of
-        from sglang.srt.kernel_plugins.amd.binding import features_in_use
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        from sglang.srt.arg_groups.overrides import attention_backends_of
-        from sglang.srt.monokernels.guards import features_in_use
+    from sglang.srt.monokernels.guards import features_in_use
 
     req = spec.requires
     reasons = [
@@ -106,7 +93,7 @@ SPEC = MonoSpec(
     numerics=m3.SPEC.numerics,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # the spec module's MONOKERNEL_API_VERSION
+    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
     load_tensor=_load_tensor,
 )

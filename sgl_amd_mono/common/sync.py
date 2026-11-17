@@ -18,7 +18,6 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_SYS,
-    bf2_f32,
     bf16_pair,
     rsrc,
     uniform,
@@ -106,6 +105,11 @@ def _spin(load_all, pending, guarded=True, first=None):
     return v
 
 
+# a word many CTAs publish at once gets a 128-byte line of its own (16 pairs): stores
+# from many CUs into one line serialize where the line lives
+FLAG_STRIDE = 16
+
+
 class Space(Enum):
     SCRATCH = "scratch"  # this GPU's memory: device-scope hand-off between CTAs
     PEER = "peer"  # a peer-symmetric region: system-scope hand-off between GPUs
@@ -127,11 +131,6 @@ def sreg(base, offset, region):
 def preg(base, offset, region):
     """Return the address of peer-symmetric region ``region`` at byte ``offset`` of buffer ``base``."""
     return Addr(region, Space.PEER, base + fx.Int64(offset))
-
-
-def shift(a, delta):
-    """``a`` moved by ``delta`` bytes (a traced or Python integer), same region."""
-    return Addr(a.region, a.space, a.value + delta)
 
 
 # the store / load cache policy of a hand-off in each space
@@ -245,111 +244,3 @@ def publish(put, a, i, v, who):
     gpu.barrier()
     if who:
         put(a, i, v)
-
-
-# ---------------------------------------------------------------- sentinel words
-# A sentinel region holds plain words, not tagged pairs: an unwritten word is
-# SENT (all ones, a bf16 -NaN pair) and a pushed word never is (``sent_word``).
-# Its reader polls a word off SENT and re-arms it, so a region needs no tag,
-# half a tagged pair's bytes, and nothing to zero a step. A word must not be
-# pushed again before its reader re-armed it: the caller alternates two copies.
-SENT = -1
-SENT_NAN = -4128832  # 0xFFC0FFC0: what a pushed SENT word becomes
-
-
-def sent_word(w):
-    """A bf16-pair word to push to a sentinel region (never SENT)."""
-    w = w.bitcast(fx.Int32) if isinstance(w, fx.Float32) else fx.Int32(w)
-    return (w == fx.Int32(SENT)).select(fx.Int32(SENT_NAN), w)
-
-
-def put_sent(a, i, word):
-    """Word ``i`` of sentinel region ``a`` := ``word`` (from ``sent_word``)."""
-    bo.buffer_store(fx.Int32(word), rsrc(a.value), i, cache_modifier=_SCOPE_CM[a.space])
-
-
-def poll_sent(a, idxs, lives=None, rearm=True):
-    """Words ``idxs`` of this rank's sentinel region ``a`` once none is SENT,
-    re-armed unless ``rearm`` is off (the caller's ``rearm_sent`` then). A dead
-    index (``lives``) is neither waited for nor re-armed. A read consumes the
-    word: one thread a word."""
-    cm = _SCOPE_CM[a.space]
-    base = a.value
-
-    def load_all():
-        return fx.Vector.from_elements(
-            [
-                fx.Int32(
-                    bo.buffer_load(
-                        rsrc(base),
-                        fx.Int32(i),
-                        vec_width=1,
-                        dtype=T.i32,
-                        cache_modifier=cm,
-                    )
-                )
-                for i in idxs
-            ],
-            fx.Int32,
-        )
-
-    def pending(v):
-        bad = None
-        for e in range_constexpr(len(idxs)):
-            b = v[e] == fx.Int32(SENT)
-            if const_expr(lives is not None):
-                b = b & lives[e]
-            bad = b if bad is None else bad | b
-        return bad
-
-    v = _spin(load_all, pending)
-    if const_expr(rearm):
-        rearm_sent(a, idxs, lives)
-    return [v[e] for e in range(len(idxs))]
-
-
-def rearm_sent(a, idxs, lives=None):
-    """Words ``idxs`` of this rank's sentinel region ``a`` := SENT (a dead index
-    skipped), after this thread read them."""
-    cm = _SCOPE_CM[a.space]
-    for e in range_constexpr(len(idxs)):
-        if const_expr(lives is None):
-            bo.buffer_store(
-                fx.Int32(SENT), rsrc(a.value), fx.Int32(idxs[e]), cache_modifier=cm
-            )
-        else:
-            _rearm(a.value, idxs[e], lives[e], cm)
-
-
-@flyc.jit
-def _rearm(base, i, live, cm):
-    if live:
-        bo.buffer_store(fx.Int32(SENT), rsrc(base), fx.Int32(i), cache_modifier=cm)
-
-
-def sent_ix(src, col, t, s, width):
-    """The word of (source rank, bf16 pair at ``col``, token t) in a [rank][token]
-    [width] sentinel all-reduce region, blocked [src][16 columns][token][8 pairs]
-    so ``sent_item``'s consecutive items read consecutive words."""
-    return ((src * (width // 16) + col // 16) * s + t) * 8 + (col % 16) // 2
-
-
-def sent_item(idx, s):
-    """Reduce item ``idx``'s (token, column pair) within a 128-column task."""
-    g = idx // (8 * s)
-    r = idx % (8 * s)
-    return r // 8, g * 8 + r % 8
-
-
-def sent_sum(own, col, t, s, width, tp, rearm=True):
-    """The ``tp`` ranks' words of (col pair, t) in sentinel region ``own``,
-    summed in fp32 in rank order (as ``ops.sum_partials``)."""
-    ws = poll_sent(
-        own, [sent_ix(src, col, t, s, width) for src in range(tp)], rearm=rearm
-    )
-    acc0, acc1 = bf2_f32(ws[0])
-    for src in range_constexpr(1, tp):
-        lo, hi = bf2_f32(ws[src])
-        acc0 = acc0 + lo
-        acc1 = acc1 + hi
-    return acc0, acc1
