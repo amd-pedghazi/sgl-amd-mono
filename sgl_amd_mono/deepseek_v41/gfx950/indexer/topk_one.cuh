@@ -144,7 +144,7 @@ struct Split : TopKSplit {
     const auto topk = problem.topk;
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
-    const bool zero_bin = is_zero_bin(v_lo);
+    const bool zero_bin = impl::kExact && zero_bin_shortcut(v_lo);
     if (zero_bin && tx == 0) smem->tie_nonzero = 0;
     __syncthreads();
     for_each_input(problem.in + chunk.start, chunk.len, [&](float val, uint32_t local) {
@@ -192,7 +192,7 @@ struct Split : TopKSplit {
         if (l2_read(&ctr->ranks) != kRanks) __builtin_trap();
         smem->total_gt = l2_read(&ctr->count_gt);
         smem->total_eq = l2_read(&ctr->count_eq);
-        if (is_zero_bin(smem->v_lo)) smem->tie_nonzero = l2_read(&ctr->tie_nonzero);
+        if (impl::kExact && zero_bin_shortcut(smem->v_lo)) smem->tie_nonzero = l2_read(&ctr->tie_nonzero);
         l2_zero(&ctr->count_gt);
         l2_zero(&ctr->count_eq);
         l2_zero(&ctr->tie_nonzero);
@@ -214,7 +214,7 @@ struct Split : TopKSplit {
   SGL_DEVICE static void finish_ties(const TopKProblem& problem, impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
     uint32_t above_count, tie_count;
-    const bool zero_ties = is_zero_bin(smem->v_lo) && smem->tie_nonzero == 0;
+    const bool zero_ties = impl::kExact && zero_bin_shortcut(smem->v_lo) && smem->tie_nonzero == 0;
     if (smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
       if (tx == 0) smem->count_gt = smem->total_gt;
       __syncthreads();
