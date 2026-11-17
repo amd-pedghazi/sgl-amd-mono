@@ -39,3 +39,9 @@ Portions are adapted from ROCm/aiter (https://github.com/ROCm/aiter): the GLM-5.
 decoder-layer kernel of ROCm/aiter#6173 (Copyright (c) 2025 FlyDSL Project
 Contributors). Each adapted file names its origin in its header. These portions
 are distributed under the Apache License 2.0.
+
+Portions are adapted from vllm-project/vllm#65421 (https://github.com/vllm-project/vllm/pull/65421)
+at 7ba343d8: the DeepSeek-V4.1 gfx950 assembly kernel generators and their FFN-half
+and all-reduce host runners under sgl_amd_mono/deepseek_v41/asm/. Each adapted file
+names its origin in its header. These portions are distributed under the Apache
+License 2.0.

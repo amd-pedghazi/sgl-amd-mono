@@ -21,15 +21,12 @@ inputs, within the spec's bounds, and one rank's down or gate | up scales x2 fai
 them; ``--check-embed``: layer 0 from the token ids equals the dense launch fed the
 gathered embedding rows (outputs, cache rows, top-k), and a changed token id differs;
 ``--check-head``: the tail's logits against a torch and an f32 tail, within the
-spec's bounds, and the final norm x1.01 fails them. ``--similar X``: the live rows of a
-request are one random row plus X times their own, so they route alike, as a verify
-step's rows do (with ``--rowsets v4``).
+spec's bounds, and the final norm x1.01 fails them.
 
-``--dump DIR`` writes, per run and rank, the SHA-256 of every launch's output rows
-(the tail's: its gathered logits), of the cache rows and top-k entries it writes,
-and after each width of every cache whole (``--perturb`` negates one input value, a
-negative control); ``--compare A B`` matches two dump directories and exits 1 on
-any difference."""
+``--dump DIR`` writes, per run and rank, the SHA-256 of every launch's output rows,
+of the cache rows and top-k entries it writes, and after each width of every cache
+whole (``--perturb`` negates one input value, a negative control); ``--compare A B``
+matches two dump directories and exits 1 on any difference."""
 
 import argparse
 import hashlib
@@ -321,7 +318,6 @@ class Model:
         stop=False,
         head=False,
         first=None,
-        similar=0.0,
     ):
         from sgl_amd_mono.glm53.gfx950.runner import (
             Glm53Build,
@@ -384,14 +380,7 @@ class Model:
             rt.set_deadline(args.deadline)
             self.head = Glm53HeadOp(rt, head_weights(rank, tp, device))
         g = _gen(3, device)
-        h = torch.randn(W, HIDDEN, generator=g, device=device)
-        if similar:
-            base = h.clone()
-            noise = similar * torch.randn(W, HIDDEN, generator=g, device=device)
-            for s, (p, r) in enumerate(zip(positions, requests)):
-                if p is not None:
-                    h[s] = base[r] + noise[s]
-        self.h = h.bfloat16()
+        self.h = torch.randn(W, HIDDEN, generator=g, device=device).bfloat16()
         if kinds[:1] == ["embed"]:
             self.h = token_ids(positions, device)
 
@@ -749,10 +738,6 @@ def dump(model: Model, name: str, steps: int, perturb: bool, out: dict) -> str:
             out[f"{name}/s{step}/l{i}"] = d
 
         h = model.step(after=after)
-        if model.head is not None:
-            out[f"{name}/s{step}/tail"] = {
-                f"out.r{s}": _digest(h[s]) for s in range(h.shape[0])
-            }
         torch.cuda.synchronize()
     whole = {f"kv.l{i}": _digest(c.kv) for i, c in enumerate(model.caches)}
     whole.update(
@@ -815,7 +800,6 @@ def main() -> int:
     ap.add_argument("--check-head", action="store_true")
     ap.add_argument("--dump", default="", help="write the digests into DIR")
     ap.add_argument("--perturb", action="store_true", help="negate one input value")
-    ap.add_argument("--similar", type=float, default=0.0, help="rows routing alike")
     ap.add_argument("--compare", nargs=2, metavar=("A_DIR", "B_DIR"))
     args = ap.parse_args()
     if args.compare:
@@ -833,16 +817,7 @@ def main() -> int:
     ]:
         positions, requests = rows_of(W, rowset)
         model = Model(
-            kinds,
-            positions,
-            requests,
-            rank,
-            tp,
-            group,
-            device,
-            args,
-            head=head,
-            similar=args.similar,
+            kinds, positions, requests, rank, tp, group, device, args, head=head
         )
         name = f"{args.kv}-{args.kind}/w{W}{rowset}"
         if args.dump:

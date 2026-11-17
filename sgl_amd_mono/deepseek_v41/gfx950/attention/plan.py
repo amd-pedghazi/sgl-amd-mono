@@ -4,6 +4,8 @@
 
 import msgspec
 
+from sgl_amd_mono.common.sync import FLAG_STRIDE
+
 HIDDEN = 5120
 Q_RANK = 1280
 KV_DIM = 512
@@ -28,6 +30,9 @@ WOA_ROWS = 32  # a wo_a task's rows: one MX group of its output
 DATA = 576
 
 PAIR = 8  # a mailbox (value, tag) pair
+COMB_PARTS = (
+    2  # K2's combine units a (token, 8-head group): a part of the head dims each
+)
 KEYS = TOPK + WINDOW  # a token's attention keys at most
 
 
@@ -43,15 +48,20 @@ class Dims(msgspec.Struct, frozen=True):
     tp: int
 
     def __post_init__(self):
-        assert self.tp in (2, 4), self.tp
+        assert self.tp in (2, 4, 8), self.tp
 
     @property
     def heads(self) -> int:
         return N_HEADS // self.tp
 
     @property
+    def tile_heads(self) -> int:
+        """``heads`` padded to whole head tiles: TP8's 8 heads fill half of one."""
+        return round_up(self.heads, HEAD_TILE)
+
+    @property
     def head_tiles(self) -> int:
-        return self.heads // HEAD_TILE
+        return self.tile_heads // HEAD_TILE
 
     @property
     def groups(self) -> int:
@@ -130,29 +140,45 @@ def front_scratch(s: int, d: Dims) -> dict:
             ("qkvp", WQKV_KPARTS * s * QKV_ROWS * PAIR),
             ("qx8", s * Q_RANK),  # e4m3 words
             ("qx8s", s * Q_RANK // 32 * 4),  # an i32 code a group
-            ("qrdy", s * PAIR),
+            ("qrdy", s * PAIR * FLAG_STRIDE),
             # an index source's ``index_query``: bf16 IQ, a flag a (token tile, 16-column task)
             ("iq", s * 4096 * 2),
             ("iqrdy", cdiv(s, 16) * 256 * PAIR),
+            # its head weights' partials, a pair a (token, head, 512-K split)
+            ("iwp", cdiv(s, 16) * 32 * 16 * (HIDDEN // 512) * PAIR),
+            # its compressor projection's partials, a pair a (token, column, K quarter)
+            ("cpp", cdiv(s, 16) * 16 * 1024 * 4 * PAIR),
+            # a flag a (token tile, 16-column tile) of it, once its sums are stored
+            ("cprdy", cdiv(s, 16) * 64 * PAIR),
         ]
     )
 
 
+def split_keys(d: Dims, s: int) -> int:
+    """A split unit's keys (K2's flash-decoding over a chunk of a token's keys): 64
+    where the units fit, else 128. Two head tiles: both tiles' units of every chunk
+    fit the grid. One: every chunk's units and the combine's fit 112 CTAs; past that
+    the combine's twice as many partials cost more than the split's halved gather."""
+    if d.head_tiles == 2:
+        return 64 if s * cdiv(KEYS, 64) <= 256 else 128
+    units = s * (cdiv(KEYS, 64) + d.heads // 8 * COMB_PARTS)
+    return 64 if units <= 112 else 128
+
+
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
     """Return K2's scratch regions past ``start`` -> (byte offset, bytes)."""
-    # must match back.chunk_keys
-    ck = 64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
-    nchunk = cdiv(KEYS, ck)
+    nchunk = cdiv(KEYS, split_keys(d, s))
     return byte_layout(
         [
             ("part", s * nchunk * d.heads * HEAD_DIM * 2),  # bf16 partials
             ("pstat", s * nchunk * d.heads * 8),  # (max, sum) f32
-            ("srdy", s * nchunk * PAIR),
+            ("srdy", s * nchunk * PAIR * FLAG_STRIDE),
             ("xo", s * d.q_rows * 2),  # bf16: wo_a reads it unquantized
-            ("crdy", s * d.heads // 8 * PAIR),
+            ("crdy", s * d.heads // 8 * COMB_PARTS * PAIR * FLAG_STRIDE),
             ("x8b", s * d.o_rows),
             ("x8bs", s * d.o_rows // 32 * 4),
-            ("ardy", d.woa_tasks * cdiv(s, ROWS) * PAIR),  # a flag a wo_a unit
+            # a flag a wo_a unit, a line each (``FLAG_STRIDE``)
+            ("ardy", d.woa_tasks * cdiv(s, ROWS) * PAIR * FLAG_STRIDE),
         ],
         start=start,
     )

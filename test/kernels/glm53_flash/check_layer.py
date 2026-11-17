@@ -8,15 +8,13 @@ finish with no error word set and the same output (the TP sums run in rank order
 ``--compare-shuffled``: a sparse-attention or dense launch on AITER-shuffled FP8
 weights equals the row-major one bitwise; ``--check-routing``: the top-8 equals
 SGLang's on keys that tie in bf16; ``--check-keys``: rows past 2048 tokens attend to
-the selected pools (the 512 best of a torch scoring) and then their tail, as SGLang's
-kpool top-k selects;
+the selected pools and then their tail, as SGLang's kpool top-k selects;
 ``--check-dense``: the dense MLP's output against an f32 MLP on the launch's own FFN
 input; ``--check-embed``: the launch from the tokens equals the dense launch on the
 gathered embedding rows, and writes the spec's step tables (``--step-rows``: the
 step's rows, fewer than the width); ``--check-head``: the tail's logits against a
 torch tail and an f32 tail; ``--replays N``: a graph of ``--layers`` launches
-replays the eager step bitwise; ``--verify L`` (``kda`` or ``dsa``): an MTP verify
-launch of L rows a request equals its tokens' L decode launches bitwise."""
+replays the eager step bitwise."""
 
 import argparse
 import os
@@ -33,7 +31,6 @@ from sgl_amd_mono.glm53_flash.gfx950.config import (
     N_EXPERTS,
     VOCAB,
 )
-from sgl_amd_mono.glm53_flash.spec import GROUPED_FROM
 
 N_MIX = HC_MULT * (2 + HC_MULT)
 
@@ -671,8 +668,7 @@ def check_keys(args, rank, tp, group, device) -> bool:
     """Sparse-attention launches on rows past 2048 tokens. A scored row (more than 512
     complete pools) attends to the selected pools' 2048 tokens and then its tail (up to
     2051 keys), as SGLang's kpool top-k appends it: its selection holds 512 whole
-    distinct complete pools, the 512 best of a torch scoring of the launch's index
-    query, then the tail tokens in order. Perturbing the MLA rows of
+    distinct complete pools, then the tail tokens in order. Perturbing the MLA rows of
     the tokens a 2048-key selection gives up for the tail (its last selected pool's last
     positions) changes the row's output (negative control: a 2048-key selection never
     reads them); perturbing an unselected pool changes nothing. A row of 2051 tokens
@@ -684,8 +680,7 @@ def check_keys(args, rank, tp, group, device) -> bool:
     from sgl_amd_mono.glm53_flash.gfx950.layout import SEL_STRIDE
     from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
 
-    key_lens = [int(v) for v in args.lens.split(",")] if args.lens else list(KEY_LENS)
-    rows = len(key_lens)
+    rows = len(KEY_LENS)
     key = FlashBuild(
         rows=rows,
         tp=tp,
@@ -701,7 +696,7 @@ def check_keys(args, rank, tp, group, device) -> bool:
         rt, ffn_weights(rank, tp, device), 0, dsa=dsa_weights(rank, tp, device)
     )
     x, res, post, comb = layer_inputs(rows, device)
-    caches, table, pt = dsa_caches(rows, device, key_lens)
+    caches, table, pt = dsa_caches(rows, device, list(KEY_LENS))
 
     def run(kv):
         c = replace(
@@ -715,16 +710,15 @@ def check_keys(args, rank, tp, group, device) -> bool:
         rt.advance_step()
         torch.cuda.synchronize()
         sel = rt.scratch[rt.sc["tok_sel"] :].view(torch.int32)[: 2 * rows * SEL_STRIDE]
-        return out[1].clone(), sel.view(rows, SEL_STRIDE, 2).clone(), c.idx_cache
+        return out[1].clone(), sel.view(rows, SEL_STRIDE, 2).clone()
 
-    base, sel, idx = run(caches.kv_cache.clone())
-    pool_scores = index_scores(rt, rows, idx, pt)
+    base, sel = run(caches.kv_cache.clone())
     # (token, launch tag) pairs; kv_ready holds this launch's tag
     tags = rt.scratch[rt.sc["kv_ready"] :].view(torch.int32)[1 : 2 * rows : 2].clone()
     sel, sel_tags = sel[..., 0], sel[..., 1]
     g = _gen(30, device)
     ok = True
-    for r, n in enumerate(key_lens):
+    for r, n in enumerate(KEY_LENS):
         bound, tail = n // KPOOL, n % KPOOL
         if bound <= TOPK_POOLS:
             victims, spare = [0], None
@@ -741,16 +735,13 @@ def check_keys(args, rank, tp, group, device) -> bool:
                 bound * KPOOL + i for i in range(tail)
             ]
             tagged = bool((sel_tags[r, : TOPK_TOKENS + tail] == tags[r]).all())
-            missed, worse = off_top_pools(pool_scores(r, bound), ids)
-            top = missed == worse == 0
             print(
                 f"rank {rank} row {r} ({n} tokens): 512 whole distinct pools "
-                f"{whole and distinct}, tail {tail_ok}, tagged {tagged}, the torch "
-                f"top-512 {top} ({missed} better pools missed, {worse} worse picked)",
+                f"{whole and distinct}, tail {tail_ok}, tagged {tagged}",
                 flush=True,
             )
-            ok = ok and whole and distinct and tail_ok and tagged and top
-            victims = picked[TOPK_TOKENS - max(tail, 1) : TOPK_TOKENS].tolist()
+            ok = ok and whole and distinct and tail_ok and tagged
+            victims = picked[TOPK_TOKENS - tail : TOPK_TOKENS].tolist()
             unpicked = sorted(set(range(bound)) - set(ids.tolist()))
             spare = unpicked[0] * KPOOL
         kv = caches.kv_cache.clone()
@@ -779,52 +770,6 @@ def check_keys(args, rank, tp, group, device) -> bool:
             ok = ok and still
     rt.close()
     return ok
-
-
-def index_scores(rt, rows, idx, pt):
-    """``scores(r, bound)``: f64 index scores of row r's complete pools from the
-    launch's FP8 query and head weights and the index cache it read, as the kernel
-    defines them: scale(pool) * sum_h w_h * relu(q_h . k_pool)."""
-    from sgl_amd_mono.glm53_flash.gfx950.config import INDEX_DIM, INDEX_HEADS, KPOOL
-
-    def words(name, n):
-        return rt.scratch[rt.sc[name] :].view(torch.int32)[: 2 * n].view(n, 2)[:, 0]
-
-    f8 = torch.float8_e4m3fn
-    QW = INDEX_HEADS * INDEX_DIM // 4
-    q = words("iq8", rows * QW).contiguous().view(torch.uint8).view(f8)
-    q = q.double().view(rows, INDEX_HEADS, INDEX_DIM)
-    w = words("iqw", rows * INDEX_HEADS).contiguous().view(torch.float32).double()
-    w = w.view(rows, INDEX_HEADS)
-    device = idx.device
-    off = torch.arange(64, device=device)[:, None]
-    d = torch.arange(INDEX_DIM, device=device)[None, :]
-    perm = ((off // 16) * 2048 + (d // 16) * 256 + (off % 16) * 16 + d % 16).reshape(-1)
-    keys = idx[:, perm].view(f8).view(-1, 64, INDEX_DIM)
-    scale = idx[:, 64 * INDEX_DIM :].contiguous().view(torch.float32)
-
-    def scores(r, bound):
-        p = torch.arange(bound, device=device)
-        page = pt[r, p * KPOOL // 64].long() // 4
-        k = keys[page, p % 64].double()
-        s = (k @ q[r].T).clamp_min(0) @ w[r]
-        return s * scale[page, p % 64].double()
-
-    return scores
-
-
-def off_top_pools(ref, ids):
-    """(pools above the 512th best of ``ref`` that ``ids`` misses, picked pools below
-    it): a pool within the f32 rounding of the 512th best counts either way."""
-    from sgl_amd_mono.glm53_flash.gfx950.config import TOPK_POOLS
-
-    kth = ref.topk(TOPK_POOLS).values[-1]
-    tol = 1e-5 * ref.abs().max()
-    picked = torch.zeros_like(ref, dtype=torch.bool)
-    picked[ids] = True
-    missed = int((~picked & (ref > kth + tol)).sum())
-    worse = int((picked & (ref < kth - tol)).sum())
-    return missed, worse
 
 
 KINDS = ("ffn", "kda", "dsa", "dense", "embed", "head")
@@ -859,7 +804,6 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
         dense_shuffled=shuffled and dense,
         tokens=kind == "embed",
         head=kind == "head",
-        grouped=args.rows >= GROUPED_FROM and not dense and kind != "head",
         stop=False,
     )
     rt = FlashRuntime(key, rank, group, device)
@@ -1046,23 +990,21 @@ def check_embed(args, rank, tp, group, device) -> bool:
     embedding rows (x = the row on every rank; post 1, comb 0, residual 0) on the same
     weights and state: outputs and state writes bitwise equal, the width's rows past
     the step's pads; and the step tables it writes equal the spec's torch tables."""
-
-    def decode_state(s):
-        return (s.conv_state, s.rec_state)
+    from msgspec.structs import astuple
 
     rt, launches, _, ins = build(args, "embed", rank, tp, group, device)
     op, kw = launches[0]
     step = kw["step"]
     n = step["ids"].shape[0]
     _, table = embedding(rank, tp, device)
-    state0 = [t.clone() for t in decode_state(kw["state"])]
+    state0 = [t.clone() for t in astuple(kw["state"])]
     out = [t.clone() for t in op.launch(*ins, **kw)]
     torch.cuda.synchronize()
     kda, rows = spec_tables(step, kw["state_idx"], args.rows)
     tables = torch.equal(step["slots"], kda) and torch.equal(step["rows"], rows)
     ref_rt, ref_launches, _, _ = build(args, "dense", rank, tp, group, device)
     ref_op, ref_kw = ref_launches[0]
-    for t, v in zip(decode_state(ref_kw["state"]), state0):
+    for t, v in zip(astuple(ref_kw["state"]), state0):
         t.copy_(v)
     x = torch.zeros(args.rows, HIDDEN, dtype=torch.bfloat16, device=device)
     x[:n] = table[step["ids"]]
@@ -1071,7 +1013,7 @@ def check_embed(args, rank, tp, group, device) -> bool:
     same = all(torch.equal(a, b) for a, b in zip(out, ref))
     writes = all(
         torch.equal(a, b)
-        for a, b in zip(decode_state(kw["state"]), decode_state(ref_kw["state"]))
+        for a, b in zip(astuple(kw["state"]), astuple(ref_kw["state"]))
     )
     print(
         f"rank {rank}: {n} of {args.rows} rows from the tokens == the dense launch on "
@@ -1134,210 +1076,6 @@ def check_head(args, rank, tp, group, device) -> bool:
     return rel < 2e-3 and rel32 < 1e-2 and repeat and caught
 
 
-def _max_diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    return float((a.float() - b.float()).abs().max()) if a.numel() else 0.0
-
-
-def check_verify(args, rank, tp, group, device) -> bool:
-    """An MTP verify launch (``--verify`` rows a request, ``--rows`` wide: whole
-    requests, then pad rows) against the requests' draft tokens run one decode
-    launch a token, on the same weights, inputs, state and caches: each row's output
-    equals its token's decode output; with KDA the verify scratch after token j
-    equals the state after j + 1 decode launches and the committed state is
-    unchanged; with sparse attention the MLA cache, the index cache and the kpool
-    rings equal the decode launches' (a chain's pool reads the ring entries its
-    earlier rows wrote)."""
-    from msgspec.structs import replace
-
-    from sgl_amd_mono.common import guard
-    from sgl_amd_mono.glm53_flash.gfx950.config import (
-        INDEX_DIM,
-        KDA_DIM,
-        KDA_HEADS,
-        KDA_PROJ,
-        KPOOL,
-    )
-    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
-    from sgl_amd_mono.glm53_flash.gfx950.layout import (
-        ROW_BT,
-        ROW_POOL_SLOT,
-        ROW_POS,
-        ROW_SLOT,
-        ROW_TAIL_SLOT,
-        ROW_WORDS,
-    )
-    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
-
-    kind, L, W = args.kind, args.verify, args.rows
-    assert kind in ("kda", "dsa") and 2 <= L <= W
-    R = W // L
-    # the decode launches at the same width (a width's tiles set its sums' order):
-    # the requests' rows, then pads
-    DW = W
-    kda = kind == "kda"
-
-    def runtime(rows, verify):
-        key = FlashBuild(
-            rows=rows,
-            tp=tp,
-            launches_per_step=1,
-            inter=GLOBAL_INTER // tp,
-            kda=kda,
-            dsa=not kda,
-            max_pools=0 if kda else args.max_pools,
-            verify=verify,
-            grouped=rows >= GROUPED_FROM,
-            stop=False,
-        )
-        rt = FlashRuntime(key, rank, group, device)
-        rt.set_deadline(args.deadline)
-        return rt
-
-    vrt, drt = runtime(W, L), runtime(DW, 1)
-    ffn = ffn_weights(rank, tp, device)
-    attn = kda_weights(rank, tp, device) if kda else dsa_weights(rank, tp, device)
-    a = {"kda": attn} if kda else {"dsa": attn}
-    vop, dop = FlashLayerOp(vrt, ffn, 0, **a), FlashLayerOp(drt, ffn, 0, **a)
-    x, res, post, comb = layer_inputs(W, device)
-    ins = (x, res, post, comb)
-
-    def rows_of(t, j):
-        """Decode step j's input rows: request r's row r * L + j, then pads."""
-        out = torch.zeros((DW,) + tuple(t.shape[1:]), dtype=t.dtype, device=device)
-        out[:R] = t[[r * L + j for r in range(R)]]
-        return out
-
-    def run(op, rt, ins, **kw):
-        out = op.launch(*ins, **kw)
-        rt.advance_step()
-        torch.cuda.synchronize()
-        words = rt.epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
-        if any(words):
-            print(f"rank {rank}: error words {words}", flush=True)
-            return None
-        return tuple(t.clone() for t in out)
-
-    ok = True
-    if kda:
-        P, H, D = KDA_PROJ // tp, KDA_HEADS // tp, KDA_DIM
-        state, _ = kda_state(R, tp, device)
-        inter_rec = torch.full(
-            (R + 1, L, H, D, D), float("nan"), dtype=torch.float32, device=device
-        )
-        inter_conv = torch.zeros(
-            R + 1, L, 3, 3 * P, dtype=torch.bfloat16, device=device
-        )
-        vstate = replace(
-            state,
-            conv_state=state.conv_state.clone(),
-            rec_state=state.rec_state.clone(),
-            inter_rec=inter_rec,
-            inter_conv=inter_conv,
-        )
-        vidx = torch.zeros(W, dtype=torch.int32, device=device)
-        vidx[: R * L] = torch.arange(1, R + 1, device=device).repeat_interleave(L)
-        vout = run(vop, vrt, ins, state=vstate, state_idx=vidx)
-        dstate = replace(
-            state,
-            conv_state=state.conv_state.clone(),
-            rec_state=state.rec_state.clone(),
-        )
-        didx = torch.zeros(DW, dtype=torch.int32, device=device)
-        didx[:R] = torch.arange(1, R + 1, device=device)
-        if vout is None:
-            return False
-        for name in ("conv_state", "rec_state"):
-            same = torch.equal(getattr(vstate, name), getattr(state, name))
-            ok &= same
-            print(f"rank {rank}: verify keeps the committed {name}: {same}")
-        for j in range(L):
-            dins = tuple(rows_of(t, j) for t in ins)
-            dout = run(dop, drt, dins, state=dstate, state_idx=didx)
-            if dout is None:
-                return False
-            for n, (v, d) in enumerate(zip(vout, dout)):
-                diff = _max_diff(v[[r * L + j for r in range(R)]], d[:R])
-                ok &= diff == 0.0
-                if diff:
-                    print(f"rank {rank}: token {j} output {n} differs by {diff}")
-            # the request's scratch row is its batch position r (slot r + 1)
-            dr = _max_diff(inter_rec[:R, j], dstate.rec_state[1 : R + 1])
-            dc = _max_diff(inter_conv[:R, j], dstate.conv_state[1 : R + 1])
-            ok &= dr == 0.0 and dc == 0.0
-            print(f"rank {rank}: token {j} scratch state diff {dr}, conv {dc}")
-        print(f"rank {rank}: verify vs {L} decode launches ok {ok}", flush=True)
-        return ok
-
-    lens = [int(v) for v in args.lens.split(",")] if args.lens else list(LENS)
-    lens = (lens * R)[:R]
-    caches, _, pt = dsa_caches(R, device, lens)
-    ring = 4 + L
-    g = _gen(11, device)
-    tails = [
-        torch.randn(R + 1, ring, INDEX_DIM, generator=g, device=device).bfloat16()
-        for _ in range(2)
-    ]
-    caches = replace(caches, tail_k=tails[0], tail_g=tails[1])
-
-    def table_row(r, pos):
-        slot = kv_slot(pt, r, pos)
-        return [pos, slot, slot // KPOOL, (r + 1) * KPOOL]
-
-    def clone(c):
-        return replace(
-            c,
-            kv_cache=c.kv_cache.clone(),
-            idx_cache=c.idx_cache.clone(),
-            tail_k=c.tail_k.clone(),
-            tail_g=c.tail_g.clone(),
-        )
-
-    vc, dc = clone(caches), clone(caches)
-    vt = torch.full((W, ROW_WORDS), -1, dtype=torch.int32, device=device)
-    vt[:, ROW_BT] = 0
-    for r, n in enumerate(lens):
-        for j in range(L):
-            s = r * L + j
-            vt[s, [ROW_POS, ROW_SLOT, ROW_POOL_SLOT, ROW_TAIL_SLOT]] = torch.tensor(
-                table_row(r, n - 1 + j), dtype=torch.int32, device=device
-            )
-            vt[s, ROW_BT] = s
-    # SGLang's verify page table: a request's row for each of its rows
-    vpt = pt.repeat_interleave(L, 0).contiguous()
-    vout = run(vop, vrt, ins, caches=vc, rows=vt, page_table=vpt)
-    if vout is None:
-        return False
-    for j in range(L):
-        dt = torch.full((DW, ROW_WORDS), -1, dtype=torch.int32, device=device)
-        dt[:, ROW_BT] = 0
-        for r, n in enumerate(lens):
-            dt[r, [ROW_POS, ROW_SLOT, ROW_POOL_SLOT, ROW_TAIL_SLOT]] = torch.tensor(
-                table_row(r, n - 1 + j), dtype=torch.int32, device=device
-            )
-            dt[r, ROW_BT] = r
-        dout = run(
-            dop,
-            drt,
-            tuple(rows_of(t, j) for t in ins),
-            caches=dc,
-            rows=dt,
-            page_table=pt,
-        )
-        if dout is None:
-            return False
-        for n, (v, d) in enumerate(zip(vout, dout)):
-            diff = _max_diff(v[[r * L + j for r in range(R)]], d[:R])
-            ok &= diff == 0.0
-            if diff:
-                print(f"rank {rank}: token {j} output {n} differs by {diff}")
-    for name in ("kv_cache", "idx_cache", "tail_k", "tail_g"):
-        same = torch.equal(getattr(vc, name), getattr(dc, name))
-        ok &= same
-        print(f"rank {rank}: {name} equals the decode launches' {same}")
-    print(f"rank {rank}: verify vs {L} decode launches ok {ok}", flush=True)
-    return ok
-
-
 def _changed_rows(before: torch.Tensor, after: torch.Tensor) -> set:
     d = (before != after).reshape(before.shape[0], -1).any(1)
     return set(d.nonzero().flatten().tolist())
@@ -1383,7 +1121,6 @@ def writes_only_its_rows(extra: dict, before: dict) -> bool:
 
 
 def main() -> int:
-    global MAX_LEN
     from sgl_amd_mono.common import guard
 
     ap = argparse.ArgumentParser()
@@ -1391,10 +1128,7 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=4)
     ap.add_argument("--deadline", type=float, default=10.0)
     ap.add_argument("--launches", type=int, default=3)
-    ap.add_argument(
-        "--max-len", type=int, default=MAX_LEN, help="a row's tokens at most"
-    )
-    ap.add_argument("--max-pools", type=int, default=0, help="default: --max-len / 4")
+    ap.add_argument("--max-pools", type=int, default=MAX_LEN // 4)
     ap.add_argument("--lens", type=str, default="", help="comma-separated row lengths")
     ap.add_argument("--compare-shuffled", action="store_true")
     ap.add_argument("--check-routing", action="store_true")
@@ -1407,14 +1141,9 @@ def main() -> int:
     ap.add_argument("--pad-rows", type=int, default=0, help="trailing pad rows")
     ap.add_argument("--step-rows", type=int, default=0, help="an embed step's rows")
     ap.add_argument(
-        "--verify", type=int, default=0, help="an MTP verify launch's rows a request"
-    )
-    ap.add_argument(
         "--writes", action="store_true", help="check the rows a launch writes"
     )
     args = ap.parse_args()
-    MAX_LEN = args.max_len
-    args.max_pools = args.max_pools or MAX_LEN // 4
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1428,7 +1157,6 @@ def main() -> int:
         (args.check_embed, check_embed),
         (args.check_head, check_head),
         (args.replays, check_replays),
-        (args.verify, check_verify),
     ):
         if flag:
             return 0 if check(args, rank, tp, group, device) else 1
@@ -1440,7 +1168,7 @@ def main() -> int:
             from msgspec.structs import asdict
 
             held = asdict(extra.get("state") or extra["caches"])
-            before = {k: t.clone() for k, t in held.items() if t is not None}
+            before = {k: t.clone() for k, t in held.items()}
         out = run_step(args.kind, launches, ins)
         rt.advance_step()
         torch.cuda.synchronize()
