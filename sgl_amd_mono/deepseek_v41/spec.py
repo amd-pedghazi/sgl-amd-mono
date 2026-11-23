@@ -810,8 +810,9 @@ def _launch(
             L.comp_block = pool.get_extra_key_page_size(L.i)
     if pending_post[1].shape[0] > MONO_MAX:
         return asm.layer(
-            L, plan, positions, forward_batch, pending_post, prev_pre, capture
-        )
+            L=L, plan=plan, positions=positions, forward_batch=forward_batch,
+            pending_post=pending_post, prev_pre=prev_pre, capture=capture,
+        )  # fmt: skip
     x, residual, post, comb = pending_post
     backend, M = get_attn_backend(), residual.shape[0]
     if "k1" not in plan.state:
@@ -1396,11 +1397,12 @@ def _build(model, hf_config, ctx) -> _Built:
 
         # collective (IPC buffers): every rank builds it here, in the same order
         asm = AsmLayers(
-            p.tp_rank, p.tp_group.cpu_group, p.tp_size, deadline_s=ctx.deadline_s
-        )
+            rank=p.tp_rank, cpu_group=p.tp_group.cpu_group, tp=p.tp_size,
+            deadline_s=ctx.deadline_s,
+        )  # fmt: skip
         for i, L in layers.items():
             asm.add_layer(i, L)
-    return _Built(model, runner, layers, asm)
+    return _Built(model, runner, layers, asm=asm)
 
 
 class _Spec(MonoSpec, frozen=True):

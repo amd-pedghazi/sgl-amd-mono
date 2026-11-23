@@ -239,13 +239,19 @@ class AsmLayers:
         assert m <= MAX_M, m
         if self.k1 is None:
             k1 = attention_half(
-                L, positions, forward_batch, pending_post, prev_pre, capture
-            )
+                L=L, positions=positions, forward_batch=forward_batch,
+                pending_post=pending_post, prev_pre=prev_pre, capture=capture,
+            )  # fmt: skip
         else:
             k1 = self._asm_k1(
-                L, plan, positions, forward_batch, pending_post, prev_pre, capture
-            )
-        out = self.k2(self._w[L.i], *(t.contiguous() for t in k1), self.wire)
+                L=L, plan=plan, positions=positions, forward_batch=forward_batch,
+                pending_post=pending_post, prev_pre=prev_pre, capture=capture,
+            )  # fmt: skip
+        x_attn, residual, post_a, comb_a, pre_a = (t.contiguous() for t in k1)
+        out = self.k2(
+            w=self._w[L.i], x_attn=x_attn, residual=residual, post_a=post_a,
+            comb_a=comb_a, pre_a=pre_a, wire=self.wire,
+        )  # fmt: skip
         if self.check_dir is not None:
             self._check(L, forward_batch, k1, out)
         return out
@@ -263,7 +269,9 @@ class AsmLayers:
         from sgl_amd_mono.deepseek_v41.asm.k1 import sglang_index
 
         m = pending_post[1].shape[0]
-        pos, slot = k1_keys(plan, positions, forward_batch, m)
+        pos, slot = k1_keys(
+            plan=plan, positions=positions, forward_batch=forward_batch, m=m
+        )
         md = get_attn_backend().forward_metadata.core_attn_metadata
         if L.ratio:
             topk = (md.sparse_page_indices(L.ratio), md.sparse_topk_lengths(L.ratio))
@@ -272,10 +280,17 @@ class AsmLayers:
         keys = (md.swa_page_indices, md.swa_topk_lengths, *topk)
         if pending_post[0] is None and prev_pre is None:
             prev_pre = self.first_pre[:m]
+        x, residual, post, comb = pending_post
+        index = (
+            sglang_index(L=L, positions=positions, forward_batch=forward_batch)
+            if L.index
+            else None
+        )
         out = self.k1(
-            self._w1[L.i], L, *pending_post, prev_pre, pos, slot,
-            (L.swa, L.swa_block, L.comp, L.comp_block), keys,
-            sglang_index(L, positions, forward_batch) if L.index else None, self.wire,
+            w=self._w1[L.i], L=L, x=x, residual=residual, post=post, comb=comb,
+            prev_pre=prev_pre, pos=pos, slot=slot,
+            caches=(L.swa, L.swa_block, L.comp, L.comp_block), keys=keys, index=index,
+            wire=self.wire,
         )  # fmt: skip
         aux = None if capture is None else capture(L, m)
         if aux is not None:
