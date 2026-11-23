@@ -435,11 +435,12 @@ def main():
     torch.cuda.synchronize()
     eager = [t.clone() for s in steps for t in s[-1]]
 
-    # the same output copies without the launches: what torch's capture itself allocates
+    # the same output copies without the launches: what torch's capture itself allocates;
+    # control_graph stays referenced so the capture below cannot reuse its pool
     control, control_graph = captured_growth(
-        lambda: [d.copy_(d) for s in steps for d in s[-1]], dev
+        fn=lambda: [d.copy_(d) for s in steps for d in s[-1]], dev=dev
     )
-    capture, graph = captured_growth(run_all, dev)
+    capture, graph = captured_growth(fn=run_all, dev=dev)
     # replays only, before the checks below allocate or free anything
     after_capture = torch.cuda.memory_allocated(dev)
     for _ in range(64):
