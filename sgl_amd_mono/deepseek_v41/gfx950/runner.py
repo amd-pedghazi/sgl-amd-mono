@@ -10,6 +10,7 @@ from pathlib import Path
 
 import msgspec
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.plan import BLOCKS
@@ -54,23 +55,11 @@ DEFAULT_DEADLINE_S = 60.0
 
 
 def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
+    """Build the launcher without dispatching its kernels."""
     import inspect
 
-    from flydsl.utils.env import CompileEnvManager
-
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def _ensure_writable_flydsl_cache() -> None:
@@ -576,7 +565,8 @@ class DSV41MonoRunner:
                 "pre_out": (pre_out, HC, f32),
             },
         )
-        self.ffn_kernel(M)(
+        _run_compiled(
+            self.ffn_kernel(M),
             part.data_ptr(),
             residual.data_ptr(),
             post_mix.data_ptr(),
@@ -606,7 +596,7 @@ class DSV41MonoRunner:
             self.peer.addresses.data_ptr(),
             self.rank,
             self.epoch.data_ptr(),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return outs
 
@@ -625,7 +615,7 @@ class DSV41MonoRunner:
         keys: tuple,  # int32 [>= M, ...]: window slots, window lengths, top-k slots, top-k lengths
         index: bool = False,
         tok_par: bool = False,
-        aux: torch.Tensor | None = None,  # [>= M, 5120] bf16: DSpark's capture
+        aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
     ):
         """Run K1: the pending post, this layer's attention seam and the attention front.
 
@@ -651,9 +641,16 @@ class DSV41MonoRunner:
                 "post": (post, HC, f32),
                 "comb": (comb, HC * HC, f32),
             }
-        if aux is not None:
-            want["aux"] = (aux, HIDDEN, bf)
         check_rows("K1", M, self.device, want)
+        if aux is not None and not (
+            aux.dtype == bf
+            and aux.shape[0] >= M
+            and aux.shape[-1] == HIDDEN
+            and aux.stride(-1) == 1
+            and aux.stride(0) % 8 == 0
+            and aux.device == self.device
+        ):
+            raise RuntimeError(f"K1 aux: {tuple(aux.shape)} {aux.stride()} {aux.dtype}")
         if not fold:  # unread: the seam takes the residual as it is
             x = post = comb = residual
         for name, t, dtypes in (
@@ -687,7 +684,8 @@ class DSV41MonoRunner:
             else (0, 0, 0)
         )
         iw_bits = struct.unpack("<i", struct.pack("<f", w.iw_scale))[0]
-        self.k1_kernel(M, fold, index, iq, tok_par)(
+        _run_compiled(
+            self.k1_kernel(M, fold, index, iq, tok_par),
             residual.data_ptr(),
             x.data_ptr(),
             post.data_ptr(),
@@ -699,6 +697,7 @@ class DSV41MonoRunner:
             w.norm.data_ptr(),
             self.res_mid.data_ptr(),
             0 if aux is None else aux.data_ptr(),
+            HIDDEN if aux is None else aux.stride(0),
             self.post_a.data_ptr(),
             self.comb_a.data_ptr(),
             self.pre_a.data_ptr(),
@@ -735,7 +734,7 @@ class DSV41MonoRunner:
             self.peer.addresses.data_ptr(),
             self.rank,
             self.epoch.data_ptr(),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return (
             self.q[:M],
@@ -801,7 +800,8 @@ class DSV41MonoRunner:
         else:  # unread
             table = (self.klen, self.klen, self.klen, self.no_topk, self.no_topk_lens)
         slot_ptr, *key_ptrs = (t.data_ptr() for t in table)
-        self.k2_kernel(M, compressed, index, tok_par)(
+        _run_compiled(
+            self.k2_kernel(M, compressed, index, tok_par),
             self.q.data_ptr(),
             swa.data_ptr(),
             swa.stride(0),
@@ -851,6 +851,6 @@ class DSV41MonoRunner:
             self.peer.addresses.data_ptr(),
             self.rank,
             self.epoch.data_ptr(),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return outs

@@ -346,7 +346,12 @@ class _Built:
                 slot_mapping=slots, hidden=ar, residual=residual, tables=tables,
             )  # fmt: skip
             if ref is not None:
-                _log_check(m.layers[lid], lid, slots[:rows] > 0, (ar, residual), ref)
+                from sgl_amd_mono.minimax.check import log_check
+                from sgl_amd_mono.minimax_m3.gfx950.config import TOP_K
+
+                log_check(
+                    m.layers[lid], lid, slots[:rows] > 0, (ar, residual), ref, TOP_K
+                )
             if getattr(m.layers[lid], "_is_layer_to_capture", False):
                 # the pre-norm residual the attention boundary hands EAGLE3; capture() copies it
                 aux.capture(r.h[:rows])
@@ -403,47 +408,6 @@ class _Built:
             raise ValueError("MiniMax-M3 monokernels: " + "; ".join(bad))
         self.runner.bind(backend, pool)
         self.backend = backend
-
-
-def _routed_experts(layer, residual: torch.Tensor) -> torch.Tensor:
-    """Check mode: SGLang's routed experts of each row (sorted top-k ids: sigmoid
-    scores plus the correction bias) for a post-attention residual."""
-    from sgl_amd_mono.minimax_m3.gfx950.config import TOP_K
-
-    out = layer.post_attention_layernorm.forward_native(residual.clone())
-    x = out[0] if isinstance(out, tuple) else out
-    moe = layer.mlp
-    scores = (x.float() @ moe.gate.weight.float().t()).sigmoid()
-    scores = scores + moe.e_score_correction_bias.float()
-    return scores.topk(TOP_K, dim=-1).indices.sort(dim=-1).values
-
-
-def _log_check(layer, lid: int, live: torch.Tensor, got, ref) -> None:
-    """Check mode: log the launch's outputs against SGLang's on the step's live rows.
-
-    Per output, the largest difference over the largest reference value and the least
-    row cosine. The MLP output is compared on the rows whose residuals route to the
-    same experts: a row routed elsewhere differs by construction, and is counted."""
-    if not bool(live.any()):
-        return
-    alike = (
-        _routed_experts(layer, got[1][live]) == _routed_experts(layer, ref[1][live])
-    ).all(dim=-1)
-    stats = []
-    for name, o, r in zip(("mlp_out", "residual"), got, ref):
-        o, r = o[live].float(), r[live].float()
-        if name == "mlp_out":
-            o, r = o[alike], r[alike]
-        if o.numel() == 0:  # every row routed elsewhere: nothing to compare
-            stats.append(f"{name} rel 0.00000 cosine 1.000000")
-            continue
-        rel = ((o - r).abs().amax() / r.abs().amax().clamp_min(1e-30)).item()
-        cos = torch.nn.functional.cosine_similarity(o, r, dim=-1).min().item()
-        stats.append(f"{name} rel {rel:.5f} cosine {cos:.6f}")
-    logger.info(
-        "monokernel check layer %d, %d rows (%d routed alike): %s",
-        lid, int(live.sum()), int(alike.sum()), "; ".join(stats),
-    )  # fmt: skip
 
 
 def _build(model, hf_config, ctx) -> _Built:

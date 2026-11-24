@@ -21,6 +21,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels.guards import covered_capture_sizes
 
 import sgl_amd_mono
+from sgl_amd_mono.minimax import spec as family
 from sgl_amd_mono.minimax_m3 import spec as m3
 from sgl_amd_mono.minimax_m3.gfx950.config import (
     HEAD_DIM,
@@ -95,7 +96,9 @@ def test_the_plugin_registers_both_architectures():
         found, why = registry.find_spec(
             backend=sgl_amd_mono.BACKEND, architectures=[arch], isa="gfx950"
         )
-        assert found is m3.SPEC, why
+        # the architecture's spec, which MiniMax-M3.1 shares, hands M3 to this one
+        assert found is family.SPEC, why
+    assert family._model(VL) is m3
 
 
 def test_the_recipe_is_accepted():

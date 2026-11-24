@@ -11,6 +11,7 @@ and maps its top 512 back to positions and slots (``candidate_table``)."""
 from __future__ import annotations
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
     select_candidate_blocks_hip,
     topk_transform_paged_hip,
@@ -235,11 +236,12 @@ class K2iRunner:
     ) -> None:  # fmt: skip
         q_fp4, q_scale, weights = query
         payload, scale = plane
-        self.kernel(rows)(
+        _run_compiled(
+            self.kernel(rows),
             q_fp4.data_ptr(), q_scale.data_ptr(), weights.data_ptr(), payload.data_ptr(), scale.data_ptr(),
             plan.data_ptr(), itab.data_ptr(), itab_stride, itab_len, ibatch.data_ptr(), ishift,
             ibound.data_ptr(), self.ilog.data_ptr(), lstride, reindex,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )  # fmt: skip
 
 

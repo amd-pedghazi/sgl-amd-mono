@@ -3,8 +3,11 @@ switch points: decode steps of 1 to 8 rows run the kernels, wider ones the norma
 path, and requests join and leave a running batch that steps past 8 rows and back
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
 the normal prefill path (KL consistency); with MTP, verify steps of 1 and 2 requests
-(4 and 8 rows) on the kernels (GSM8K and the draft's accept length); each covered
-layer against the normal one, in decode and verify steps; and a fault on one rank
+(4 and 8 rows) on the kernels, and the NextN draft's extend of 1 and 2 requests on
+its launches (GSM8K and the draft's accept length); each covered layer against the
+normal one, in decode and verify steps, and in verify steps on the E4M3 MLA cache,
+the dense layers' MLPs, the tail's logits and each MTP draft step against SGLang's
+NextN included; the hidden states a covered step returns; and a fault on one rank
 that stops the server before any token of the failed step is sent."""
 
 import os
@@ -14,7 +17,9 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import requests
+import torch
 from glm53_server import ARGS, ENV, MODEL, MTP
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
@@ -26,15 +31,22 @@ from sglang.test.test_utils import (
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
+from transformers import AutoConfig
 
 from sgl_amd_mono import BACKEND
+from sgl_amd_mono.glm53.gfx950 import layout
 
 LAUNCH_TIMEOUT = 3600
+# the MXFP4 checkpoint (amd/GLM-5.3-Quark-MXFP4-AttnFP8), not the FP8 one
+_quant = AutoConfig.from_pretrained(MODEL, trust_remote_code=True).quantization_config
+MXFP4 = _quant.get("quant_method") == "quark"
 # The normal path scores about 0.97 on GSM8K (thinking on); the bound is for gross
 # failures
 GSM8K_BOUND = 0.90
-# Decode against prefill, one batch of prompts at a time (every decode step covered)
-KL_BOUND = 0.06
+# Decode against prefill, one batch of prompts at a time (every decode step covered).
+# On the MXFP4 checkpoint SGLang's own decode against its prefill (monokernels off)
+# reaches 0.060 (0.009 on the FP8 one): twice that
+KL_BOUND = 0.12 if MXFP4 else 0.06
 # MTP (3 draft tokens) accepts about 3.3 tokens a step on this GSM8K run at TP8;
 # the bound is for gross failures
 MTP_ACCEPT_BOUND = 2.5
@@ -109,13 +121,25 @@ class TestMonokernelMtp(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.process = _launch(extra_args=[*MTP, "--watchdog-timeout", "1200"])
+        cls.out = tempfile.NamedTemporaryFile("w+", suffix=".out")
+        cls.err = tempfile.NamedTemporaryFile("w+", suffix=".err")
+        cls.process = _launch(
+            extra_args=[*MTP, "--watchdog-timeout", "1200"], log=(cls.out, cls.err)
+        )
 
     @classmethod
     def tearDownClass(cls):
         if cls.process is not None:
             terminate_and_kill_process_tree(cls.process)
+        cls.out.close()
+        cls.err.close()
 
+    # On the MXFP4 checkpoint the dense MLPs' down_proj in SGLang's verify steps of 4
+    # and 8 requests (AITER's Triton gemm_afp4wfp4 at M = 16, 32) returns NaN rows,
+    # monokernels off alike, until the CI image has ROCm/aiter#7910
+    @pytest.mark.xfail(
+        MXFP4, reason="https://github.com/ROCm/aiter/pull/7910", strict=False
+    )
     def test_gsm8k_and_accept_length_past_the_largest_width(self):
         # 12 requests at a time: verify steps of 1 and 2 requests run the kernels,
         # wider ones the normal path. A verify row that attends the wrong keys of
@@ -126,6 +150,16 @@ class TestMonokernelMtp(CustomTestCase):
         print(f"{metrics=} {accept=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
         self.assertGreater(accept, MTP_ACCEPT_BOUND)
+        # the draft extends of 1 and 2 requests ran the NextN launches (these
+        # requests sample, so under rejection sampling the draft decode steps run
+        # SGLang's path; the check-mode test runs them greedy)
+        self.err.seek(0)
+        self.out.seek(0)
+        log = self.err.read() + self.out.read()
+        steps = re.findall(r"runs the MTP draft step \('(\w+)', (\d+), (\d+)\)", log)
+        self.assertLessEqual(
+            {("DRAFT_EXTEND_V2", "1", "4"), ("DRAFT_EXTEND_V2", "2", "8")}, set(steps)
+        )
 
 
 class TestMonokernelCheck(CustomTestCase):
@@ -142,11 +176,39 @@ class TestMonokernelCheck(CustomTestCase):
         # a row's earlier drafts from the cache misses some of them (layer.topk_own)
         self._check_layers(MTP, ((1, 200), (2, 200)), new_tokens=16, rows=(4, 8))
 
-    def _check_layers(self, extra_args, batches, new_tokens, rows):
+    def test_each_covered_verify_layer_within_its_numerics_with_fp8_kv(self):
+        # The E4M3 MLA cache (SGLang's HIP DSA rows: 576 values, no scales): the
+        # launches write the rows SGLang writes and attend the values it reads back
+        self._check_layers(
+            [*MTP, "--kv-cache-dtype", "fp8_e4m3"],
+            ((1, 200), (2, 200)),
+            new_tokens=16,
+            rows=(4, 8),
+        )
+
+    def test_each_covered_layer_past_the_parallel_top_k(self):
+        # rows of about 108k keys at widths 2 and 4 and of about 36k keys at width 8:
+        # past 98304 keys a row's top-k runs on every slice
+        past = 98304
+        self.assertGreaterEqual(
+            past, layout.INDEX_SEL_SLICES * layout.INDEX_SEL_SLICE_KEYS
+        )
+        self._check_layers(
+            [],
+            ((1, 9000), (3, 9000), (8, 3000)),
+            new_tokens=4,
+            rows=(1, 3, 8),
+            past=past,
+        )
+
+    def _check_layers(self, extra_args, batches, new_tokens, rows, past=2048):
         """SGLANG_AMD_MONO_CHECK (eager) on one server, each (requests, repeats)
         batch of a record prompt in turn: both kinds of layer checked at every
-        count in ``rows``, an indexer layer past 2048 keys, and no violation."""
+        count in ``rows``, an indexer layer past ``past`` keys, and no violation."""
+        from transformers import AutoTokenizer
+
         para = "The river valley archive lists the flood height of every year. "
+        tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
@@ -163,44 +225,123 @@ class TestMonokernelCheck(CustomTestCase):
             )
             try:
                 for n, repeats in batches:
-                    r = requests.post(
-                        DEFAULT_URL_FOR_TEST + "/generate",
-                        json={
-                            "text": [
-                                f"Record {i}. " + para * repeats for i in range(n)
-                            ],
-                            "sampling_params": {
-                                "max_new_tokens": new_tokens,
-                                "temperature": 0,
+                    # The batch's rows must decode together, but the server tokenizes
+                    # long texts one at a time, seconds apart, and prefills long
+                    # prompts a few at a time: a request in first would decode its
+                    # few tokens alone. So the prompts go as token ids, and one token
+                    # each first puts every prompt in the radix cache.
+                    ids = [
+                        tokenizer(f"Record {i}. " + para * repeats)["input_ids"]
+                        for i in range(n)
+                    ]
+                    for tokens in (1, new_tokens):
+                        r = requests.post(
+                            DEFAULT_URL_FOR_TEST + "/generate",
+                            json={
+                                "input_ids": ids,
+                                "sampling_params": {
+                                    "max_new_tokens": tokens,
+                                    "temperature": 0,
+                                },
                             },
-                        },
-                        timeout=600,
-                    )
-                    r.raise_for_status()
+                            timeout=600,
+                        )
+                        r.raise_for_status()
             finally:
                 terminate_and_kill_process_tree(process)
             err.seek(0)
             out.seek(0)
             log = err.read() + out.read()
         checks = re.findall(
-            r"monokernel check layer \d+ \((indexer|shared), (\d+) rows, positions "
-            r"\d+\.\.(\d+)\): (.*)",
+            r"monokernel check layer \d+ \((indexer|shared|dense), (\d+) rows, "
+            r"positions \d+\.\.(\d+)\): (.*)",
             log,
         )
+        # each dense layer's MLP and each tail: (rows, fields)
+        mlps = re.findall(
+            r"monokernel check dense MLP layer \d+ \((\d+) rows\): (.*)", log
+        )
+        tails = re.findall(r"monokernel check tail \((\d+) rows\): (.*)", log)
         values = {}
-        for _, _, _, fields in checks:
+        for fields in [c[3] for c in checks] + [m[1] for m in mlps + tails]:
             for name, v in re.findall(r"(\S+)=(\S+)", fields):
                 values.setdefault(name, []).append(float(v))
         for name, vs in sorted(values.items()):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(n)) for kind, n, _, _ in checks}
-        want = {(kind, n) for kind in ("indexer", "shared") for n in rows}
+        want = {(kind, n) for kind in ("indexer", "shared", "dense") for n in rows}
         self.assertTrue(want <= seen, seen)
+        for found in (mlps, tails):
+            self.assertEqual({int(n) for n, _ in found} & set(rows), set(rows))
+        self.assertIn("layer.topk_exact.max_abs", values)
         self.assertTrue(
-            any(k == "indexer" and int(hi) >= 2048 for k, _, hi, _ in checks)
+            any(k == "indexer" and int(hi) >= past for k, _, hi, _ in checks)
         )
+        if "--speculative-algorithm" in extra_args:
+            # each MTP draft step on the NextN launches, checked against SGLang's
+            drafts = re.findall(r"monokernel check draft (\d) \((index|shared),", log)
+            self.assertEqual(
+                {(int(n), kind) for n, kind in drafts},
+                {(1, "index"), (2, "shared"), (3, "shared")},
+            )
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
+
+
+def _lm_head() -> torch.Tensor:
+    """The checkpoint's LM head [vocab, hidden]."""
+    import json
+
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+
+    def path(name):
+        if os.path.isdir(MODEL):
+            return os.path.join(MODEL, name)
+        return hf_hub_download(MODEL, name)
+
+    index = json.load(open(path("model.safetensors.index.json")))
+    with safe_open(path(index["weight_map"]["lm_head.weight"]), "pt") as f:
+        return f.get_tensor("lm_head.weight")
+
+
+class TestMonokernelHiddenStates(CustomTestCase):
+    def test_returned_hidden_states_give_the_sampled_tokens(self):
+        # each covered decode step's returned row is the final norm's: times the LM
+        # head, its argmax is the token the server sampled (greedy)
+        process = _launch(
+            extra_args=["--enable-return-hidden-states", "--watchdog-timeout", "1200"]
+        )
+        try:
+            r = requests.post(
+                DEFAULT_URL_FOR_TEST + "/generate",
+                json={
+                    "text": [
+                        "The capital of France is",
+                        "Count from one to ten: one, two,",
+                        "Write a haiku about the sea.",
+                    ],
+                    "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+                    "return_hidden_states": True,
+                },
+                timeout=600,
+            )
+            r.raise_for_status()
+        finally:
+            terminate_and_kill_process_tree(process)
+        head = _lm_head().float()
+        hits = rows = 0
+        for out in r.json():
+            # hidden_states[0] is the prefill's block; row i the step sampling token i
+            decode = out["meta_info"]["hidden_states"][1:]
+            got = (torch.tensor(decode) @ head.T).argmax(-1)
+            want = torch.tensor(out["output_ids"][1 : 1 + len(decode)])
+            hits += int((got == want).sum())
+            rows += len(decode)
+        print(f"decode rows giving the sampled token: {hits} / {rows}")
+        self.assertGreaterEqual(rows, 15)
+        # bf16 near ties may part one row's argmax
+        self.assertGreaterEqual(hits, rows - 1)
 
 
 class TestMonokernelFault(CustomTestCase):
@@ -212,7 +353,14 @@ class TestMonokernelFault(CustomTestCase):
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
         ):
             process = _launch(
-                extra_env={"SGLANG_AMD_MONO_FAULT_INJECT": "1:1:20"},
+                extra_env={
+                    "SGLANG_AMD_MONO_FAULT_INJECT": "1:1:20",
+                    # the crash dumps (each rank's VRAM, py-spy of each scheduler with
+                    # no timeout, a 60 s wait) can outlast the wait for the stop below
+                    "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",
+                    "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "0",
+                    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "0",
+                },
                 extra_args=["--watchdog-timeout", "20"],
                 log=(out, err),
             )

@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
@@ -70,21 +71,9 @@ def no_capture(what: str) -> None:
 
 
 def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    from flydsl.utils.env import CompileEnvManager
-
+    """Build the launcher without dispatching its kernels."""
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def _ensure_writable_flydsl_cache() -> None:
@@ -292,7 +281,8 @@ class M3MonoRunner:
         if hidden.data_ptr() != ar.data_ptr():
             ar[:rows].copy_(hidden.view(rows, HIDDEN))
         block_table, seq_lens = tables
-        self.kernel(rows)(
+        _run_compiled(
+            self.kernel(rows),
             _ptr(self.h), _ptr(self.q), _ptr(block_table), _ptr(seq_lens),
             self.k_ptrs[i], self.v_ptrs[i], _ptr(L.k_scale), _ptr(L.v_scale),
             _ptr(L.w_o), _ptr(L.s_o), _ptr(L.g_post), _ptr(L.gate),
@@ -303,7 +293,7 @@ class M3MonoRunner:
             block_table.shape[1], query_len,
             _ptr(self.k1_args[i]), _ptr(positions), _ptr(slot_mapping),
             _ptr(residual.view(rows, HIDDEN)),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )  # fmt: skip
         if i == len(self.layers) - 1:
             # the next step's epoch, enqueued after this step's last launch

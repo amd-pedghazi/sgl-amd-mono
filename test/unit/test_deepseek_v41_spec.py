@@ -49,7 +49,10 @@ def test_the_plugin_registers_both_specs():
         ("DeepseekV4ForCausalLMDSpark", draft.SPEC),
     ):
         found, why = registry.find_spec(
-            backend=sgl_amd_mono.BACKEND, architectures=[arch], isa="gfx950"
+            backend=sgl_amd_mono.BACKEND,
+            architectures=[arch],
+            isa="gfx950",
+            model_type="deepseek_v41",
         )
         assert found is spec, why
 
@@ -128,3 +131,22 @@ def test_model_reasons(monkeypatch):
     layers[24] = _layer(24, indexer=no_gemv, freqs_cis=rope)
     reasons = dsv41.SPEC.model_disable_reasons(model, FLASH, seen)
     assert [r.split(":")[0] for r in reasons] == ["layer 20", "layer 24"], reasons
+
+
+def test_pd_runs_on_a_mori_decode_server_only():
+    def reasons(mode, backend="mori"):
+        cfg = SimpleNamespace(
+            disaggregation_mode=mode, disaggregation_transfer_backend=backend
+        )
+        return [
+            r for r in dsv41._config_disable_reasons(cfg, FLASH) if "FlyDSL" not in r
+        ]
+
+    pd = registry.Feature.PD_DISAGGREGATION
+    assert pd in dsv41.SPEC.features and pd in draft.SPEC.features
+    assert reasons("null") == reasons(None) == []
+    assert reasons("decode") == []
+    assert reasons("prefill") == ["PD monokernels support the decode role only"]
+    assert reasons("decode", "mooncake") == [
+        "PD monokernels require the mori transfer backend"
+    ]

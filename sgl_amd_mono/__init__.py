@@ -9,23 +9,53 @@ their forwards (``<model>/spec.py``, ``<model>/draft.py``) and its kernels per I
 entry point in ``pyproject.toml``), which registers each spec.
 """
 
+import os
+
 __version__ = "0.1.0.dev0"
 
 # the backend name every spec registers under
 BACKEND = "amd"
-# each spec by HF architecture; its module imports only when a server runs this backend
+# each spec by (HF architecture, model type), None for any model type; its module
+# imports only when a server runs this backend. DeepSeek-V4-Pro and V4.1 share an
+# architecture in SGLang, so their specs name their model types
 SPECS = {
-    "DeepseekV4ForCausalLM": "sgl_amd_mono.deepseek_v41.spec:SPEC",
-    "DeepseekV4ForCausalLMDSpark": "sgl_amd_mono.deepseek_v41.draft:SPEC",
-    "Glm5NextForConditionalGeneration": "sgl_amd_mono.glm53_flash.spec:SPEC",
-    "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
-    "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax_m3.spec:SPEC",
-    "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax_m3.spec:SPEC",
+    ("DeepseekV4ForCausalLM", "deepseek_v4"): "sgl_amd_mono.deepseek_v4.spec:SPEC",
+    ("DeepseekV4ForCausalLM", "deepseek_v41"): "sgl_amd_mono.deepseek_v41.spec:SPEC",
+    (
+        "DeepseekV4ForCausalLMDSpark",
+        "deepseek_v41",
+    ): "sgl_amd_mono.deepseek_v41.draft:SPEC",
+    ("Glm5NextForConditionalGeneration", None): "sgl_amd_mono.glm53_flash.spec:SPEC",
+    ("GlmMoeDsaForCausalLM", None): "sgl_amd_mono.glm53.spec:SPEC",
+    ("GlmMoeDsaForCausalLMNextN", None): "sgl_amd_mono.glm53.draft:SPEC",
+    ("MiniMaxM3SparseForCausalLM", None): "sgl_amd_mono.minimax.spec:SPEC",
+    (
+        "MiniMaxM3SparseForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.minimax.spec:SPEC",
+    ("Qwen3_5MoeForCausalLM", None): "sgl_amd_mono.qwen38_a95b_mxfp4.spec:SPEC",
+    ("KimiK3ForConditionalGeneration", None): "sgl_amd_mono.kimi_k3.spec:SPEC",
+    ("KimiK31ForConditionalGeneration", None): "sgl_amd_mono.kimi_k31.spec:SPEC",
+    (
+        "Qwen3_5MoeForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.qwen35_a17b.spec:SPEC",
+    # the MTP draft routes its own steps (qwen38_flash_next/draft.py)
+    ("Qwen4ExpForCausalLMMTP", None): "sgl_amd_mono.qwen38_flash_next.draft:SPEC",
+    (
+        "Qwen4ExpForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
+    ("MuseSparkForConditionalGeneration", None): "sgl_amd_mono.muse_spark.spec:SPEC",
+    ("DFlash2DraftModel", None): "sgl_amd_mono.muse_spark.draft:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": ("register",)
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "register",
+        "register(model_type)",
+    )
 }
 
 
@@ -36,5 +66,15 @@ def register_specs() -> None:
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         from sglang.srt.monokernels.spec import register
 
-    for architecture, path in SPECS.items():
-        register(backend=BACKEND, architecture=architecture, path=path)
+    for (architecture, model_type), path in SPECS.items():
+        register(
+            backend=BACKEND, architecture=architecture, path=path, model_type=model_type
+        )
+
+    # SGLANG_AMD_MONO_ROCM_LLVM=<llvm prefix, e.g. /opt/rocm/llvm>: compile this
+    # package's kernels with that LLVM instead of FlyDSL's bundled one (common/rocm_codegen.py)
+    llvm_dir = os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM")
+    if llvm_dir:
+        from sgl_amd_mono.common import rocm_codegen
+
+        rocm_codegen.install(llvm_dir)

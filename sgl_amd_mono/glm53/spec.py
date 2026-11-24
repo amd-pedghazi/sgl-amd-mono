@@ -5,27 +5,34 @@ sgl-project/sglang#43949).
 Every covered layer is one launch for the whole decoder layer (``gfx950/kernel.py``):
 the input norm, q_a | kv_a, the q and kv norms, the cache writes, q_b, the indexer
 (on the layers that run it) and its exact top-2048, the sparse MLA, o_proj and its
-TP reduce, the post-attention norm, the router, the routed and shared FP8 experts
-and the MoE TP reduce, adding both outputs to the hidden stream.
+TP reduce, the post-attention norm, the router, the routed and shared experts and
+the MoE TP reduce, adding both outputs to the hidden stream.
+
+The dense layers 0 to 2 run the same launch with their SwiGLU MLP in place of the
+MoE, on the experts' path. The MLPs are the checkpoint's: FP8 (per-128 FP8
+activations, as SGLang's FP8 linears) or MXFP4 (MXFP4 activations, as SGLang's
+MXFP4 ops). Layer 0 starts from the step's tokens: SGLang's embedding is not run.
+After layer 77 the tail launch runs the final norm, the LM head and the logits'
+all-gather; SGLang's final norm is not run, and its logits processor returns the
+tail's logits (``_get_logits``) and stores the final norm's rows.
 
 The forward is ``DeepseekV2ForCausalLM.forward`` for a routed decode or MTP verify
-step (a verify step's rows are its requests' draft chains): SGLang's embedding,
-dense layers 0 to 2, final norm and logits processor around the 75 MoE layers'
-launches. The first covered layer takes the stream layer 2 wrote and,
-being a layer that reuses the previous top-k, layer 2's indices. A pad row
-(SGLang's padding slot 0, or a width's row past the step) writes no cache and
-attends no key.
+step (a verify step's rows are its requests' draft chains). A pad row (SGLang's
+padding slot 0, or a width's row past the step) writes no cache and attends no key.
+The waits of a step's first launch (layer 0's, where the ranks' hosts meet) have half
+the watchdog timeout as their deadline; every other wait keeps the framework's.
 
 The kernels read SGLang's weights in place, except the copies logged at startup:
 W_UK and W_UV packed from SGLang's per-tensor FP8 w_kc and w_vc, the router and the
 indexer's weights_proj packed for the MFMA tiles, the indexer's k LayerNorm in f32,
-and one bf16 rotary table.
+one bf16 rotary table, and the dense layers' MLPs as expert-shaped slices.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import os
+from typing import Optional
 
 import msgspec
 import torch
@@ -57,9 +64,6 @@ from sgl_amd_mono.glm53 import HF_CONFIG
 WIDTHS = (2, 4, 8)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (4, 8)
-# the rows a step runs on the kernels at most at this TP size: on MI355X an 8-row
-# launch at TP4 is slower than the model's forward, so wider steps run that
-TP_MAX_ROWS = {4: 4}
 # SGLang's DSA cache on ROCm: 64-token pages
 PAGE_SIZE = 64
 TOPK = 2048
@@ -75,10 +79,12 @@ SGLANG_READS = {
         "page_size",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
+        "kv_cache_dtype",
         "speculative_algorithm",
         "speculative_eagle_topk",
         "speculative_num_steps",
         "speculative_num_draft_tokens",
+        "watchdog_timeout",
     ),
     "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/environ.py": (
@@ -91,19 +97,29 @@ SGLANG_READS = {
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("maybe_input_scattered",),
-    "srt/layers/layer_boundary/residual/batch.py": (
-        "start",
-        "fold",
-        "take_output",
-        "set_written",
-        "complete_output",
-        "final_norm",
+    "srt/layers/layer_boundary/residual/batch.py": ("start", "clear"),
+    # the logits, replaced on a routed step by the tail's
+    "srt/layers/logits_processor.py": (
+        "_get_logits",
+        "_get_logits(hidden_states)",
+        "_get_logits(lm_head)",
+        "_get_logits(logits_metadata)",
+        "do_tensor_parallel_all_gather",
+        "do_tensor_parallel_all_gather_dp_attn",
+        "use_attn_tp_group",
+        "use_fp32_lm_head",
+        "use_fp32_lm_head_output",
+        "logit_scale",
+        "final_logit_softcapping",
     ),
     "srt/mem_cache/memory_pool.py": ("get_key_buffer", "get_index_k_with_scale_buffer"),
     "srt/model_executor/forward_batch_info.py": (
         "out_cache_loc",
         "seq_lens",
         "forward_mode",
+    ),
+    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
         "is_idle",
     ),
     "srt/model_executor/forward_context.py": (
@@ -120,8 +136,7 @@ SGLANG_READS = {
         "self_attn",
         "input_layernorm",
         "indexer",
-        "gemm_output_zero_allocator_size",
-        "next_full_attention_layer_id",
+        "mlp",
         "logits_processor",
         "lm_head",
         "forward(prev_topk_indices)",
@@ -138,13 +153,14 @@ SGLANG_READS = {
         "copies",
     ),
     "srt/runtime_context.py": (
+        "get_device",
+        "get_model",
         "get_parallel",
         "process_model_config",
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
     ),
-    "srt/utils/common.py": ("BumpAllocator",),
 }
 
 # Each covered layer against SGLang's normal layer on the same input and caches
@@ -157,13 +173,103 @@ NUMERICS = Numerics(
         "layer.index.cosine": 0.999,
         # an indexer layer selects every key of a row's own draft chain SGLang selects
         "layer.topk_own.max_abs": 0.0,
+        # and exactly the top-k of its own scores (score descending, then position)
+        "layer.topk_exact.max_abs": 0.0,
+        # A dense layer's MLP (check.dense), every rank's shard summed: its mid against
+        # an f32 gate | up on its own FP8 activations, its output against the f32 down
+        # projection of its own per-128 FP8 mid, and its distance to an f32 MLP on its
+        # FFN input over SGLang's MLP's on the same input, less one. 3x the largest
+        # the serving check measured (TP8, FP8 KV, 1-8 rows, positions to 8.2K: 5.5e-5,
+        # 9.2e-3, 0.036); a down or gate | up scale x2 on one rank fails them. An MXFP4
+        # MLP reports the last only (serving max 4.4e-3).
+        # Its input, the post-attention norm of its FFN input, against SGLang's MLP's
+        # input (both bf16): the dense launch's attention, o_proj and residual. 3x
+        # the largest the serving check measured (0.029, layer 0 at 108K keys).
+        "dense.mlp_in.rel": 0.09,
+        # Its o_proj output (its TP partials summed in rank order) against SGLang's:
+        # the dense launch's attention and o_proj. The serving max is 0.068 (108K
+        # keys, where the top-k already parts at the threshold; 0.020 below 9K); the
+        # o_proj scales x1.2 give 0.197 to 0.21, so the bound sits between them.
+        "dense.attn.rel": 0.15,
+        "dense.mid.rel": 1.7e-4,
+        "dense.x.rel": 2.8e-2,
+        "dense.excess.rel": 0.11,
+        # The tail's logits against SGLang's final norm, LM head and all-gather on the
+        # same rows (serving max 5.6e-4), and against an f32 tail (serving max 2.5e-3,
+        # SGLang's own distance alike); 3x those. The final norm x1.01 gives 9.2e-3.
+        "head.logits.rel": 1.7e-3,
+        "head.logits_vs_fp32.rel": 7.5e-3,
+        # The MTP draft (draft.py, check.draft). Its NextN entry x against SGLang's
+        # eh_proj on its own enorm | hnorm rows, and against an f32 entry: 3x the
+        # serving check's maxima (TP8, FP8 KV, 1-2 requests, 1K-64K: 4.3e-3 on the
+        # MXFP4 checkpoint, where SGLang's own eh_proj is 4.4e-3 off f32, and 5.5e-4
+        # on the FP8 one; 2.9e-3, SGLang's own 2.9e-3); the enorm and hnorm weights
+        # swapped give 0.58. A draft decode row attends exactly the seed's valid
+        # entries, and the seed SGLang gets is the draft extend's top-k; a count from
+        # the row's position or every seed row row 0's gives 1-2 and 4-936.
+        "draft.eh.rel": 1.3e-2,
+        "draft.eh_vs_fp32.rel": 8.8e-3,
+        "draft.topk_extra.max_abs": 0.0,
+        "draft.seed.max_abs": 0.0,
+        # The NextN layer on the launch's x, as a target layer's (its kernel checks:
+        # equal to the plain launch fed the same x, bitwise). Its stream is x plus one
+        # layer's attention and MLP, not a residual of 78 layers, so it carries the
+        # distance of SGLang's NextN attention in full: the serving check's minimum
+        # cosine 0.963 (TP8, FP8 KV, 1-2 requests, 1K-8K), 3x the distance gives 0.89.
+        # The NextN layer rotated 4096 positions off fails it and nextn.kv.
+        "nextn.streams.cosine": 0.89,
+        "nextn.kv.cosine": 0.995,
+        "nextn.index.cosine": 0.999,
+        "nextn.topk_own.max_abs": 0.0,
+        "nextn.topk_exact.max_abs": 0.0,
     },
 )
 
 
 def _covered_layers(config) -> list[int]:
-    """The MoE layers."""
-    return list(range(config.first_k_dense_replace, config.num_hidden_layers))
+    """Every layer: the dense ones below ``first_k_dense_replace``, then the MoE ones."""
+    return list(range(config.num_hidden_layers))
+
+
+def _deadline(key, deadline_s: float, longest_s: int) -> float:
+    """A step's first launch waits up to half the watchdog, at most ``longest_s``."""
+    from sglang.srt.runtime_context import get_device
+
+    if not key.tokens:
+        return deadline_s
+    return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
+
+
+def _quant_reason(quant: dict) -> Optional[str]:
+    """Why the checkpoint's quantization is not one the kernels run, or None: the FP8
+    block-128 checkpoint, or the MXFP4 one (static FP4 weights, dynamic FP4
+    activations, an E8M0 a 32 values). Each layer's tensors are checked as loaded."""
+    method = quant.get("quant_method")
+    if method == "fp8" and list(quant.get("weight_block_size") or ()) == [128, 128]:
+        return None
+    if method == "quark":
+        g = quant.get("global_quant_config") or {}
+
+        def mx(spec: dict, dynamic: bool) -> bool:
+            return (
+                spec.get("dtype") == "fp4"
+                and spec.get("qscheme") == "per_group"
+                and spec.get("group_size") == 32
+                and spec.get("scale_format", "e8m0") == "e8m0"
+                and bool(spec.get("is_dynamic")) == dynamic
+            )
+
+        if mx(g.get("weight") or {}, False) and mx(g.get("input_tensors") or {}, True):
+            return None
+        return (
+            "needs the MXFP4 checkpoint (E2M1 a 32 with an E8M0, dynamic "
+            f"MXFP4 activations), got weight {g.get('weight')!r} input "
+            f"{g.get('input_tensors')!r}"
+        )
+    return (
+        "needs the FP8 block-128 or the MXFP4 checkpoint, got "
+        f"{method!r} {quant.get('weight_block_size')!r}"
+    )
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
@@ -191,14 +297,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
     ):
         reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
-    quant = getattr(hf_config, "quantization_config", None) or {}
-    if quant.get("quant_method") != "fp8" or list(
-        quant.get("weight_block_size") or ()
-    ) != [128, 128]:
-        reasons.append(
-            "needs the FP8 block-128 checkpoint, got "
-            f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
-        )
+    why = _quant_reason(getattr(hf_config, "quantization_config", None) or {})
+    if why is not None:
+        reasons.append(why)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -209,17 +310,27 @@ def _where(ids: list) -> str:
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
+    from sglang.srt.runtime_context import get_parallel
+
     from sgl_amd_mono.glm53.gfx950.weights import (
+        dense_reason,
+        embedding,
         experts_reason,
+        head_weights,
+        is_dense,
         unshuffled_projections,
     )
 
+    p = get_parallel()
     reasons = []
     covered = _covered_layers(hf_config)
     row_major, unrotated = {}, []
     for i in covered:
         layer = model.model.layers[i]
-        why = experts_reason(layer.mlp)
+        if is_dense(layer):
+            why = dense_reason(layer, p.tp_size)
+        else:
+            why = experts_reason(layer.mlp)
         if why is not None:
             reasons.append(f"layer {i}: {why}")
         for name in unshuffled_projections(layer):
@@ -237,13 +348,31 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             f"the indexer of {_where(unrotated)}: needs SGLang's gfx950 fused DSA "
             "indexer, which caches rotated index keys"
         )
-    first = model.model.layers[covered[0]]
-    prev = model.model.layers[covered[0] - 1]
-    if first.self_attn.indexer is None and prev.self_attn.indexer is None:
+    if model.model.layers[covered[0]].self_attn.indexer is None:
+        reasons.append(f"layer {covered[0]} reuses a top-k no layer computed")
+    lp = model.logits_processor
+    if (
+        not lp.do_tensor_parallel_all_gather
+        or lp.do_tensor_parallel_all_gather_dp_attn
+        or lp.use_attn_tp_group
+    ):
         reasons.append(
-            f"layer {covered[0]} reuses the top-k of layer {covered[0] - 1}, which "
-            "does not compute it"
+            "the tail all-gathers the logits over the TP group, as the logits "
+            "processor does without DP attention or a DP LM head"
         )
+    if lp.use_fp32_lm_head or lp.use_fp32_lm_head_output:
+        reasons.append("the tail runs the LM head in bf16, not f32")
+    for name, value in (
+        ("logit_scale", lp.logit_scale),
+        ("final_logit_softcapping", lp.final_logit_softcapping),
+    ):
+        if value:
+            reasons.append(f"the tail does not apply the logits processor's {name}")
+    for name, weights in (("LM head", head_weights), ("embedding", embedding)):
+        try:
+            weights(model, p.tp_size, p.tp_rank)
+        except ValueError as e:
+            reasons.append(f"{name}: {e}")
     return reasons
 
 
@@ -259,23 +388,30 @@ class _Layer:
 
 class _Built:
     """One rank's monokernels: the runtimes per (width, kind), each covered layer's
-    ops, the step's rows per width, and the forward."""
+    ops, the tail's op per width, the step's rows per width, and the forward."""
 
     def __init__(
-        self, lm, layers: dict, runtimes: dict, cos, sin, tp: int, device, context_len
+        self,
+        lm,
+        layers: dict,
+        runtimes: dict,
+        heads: dict,
+        cos,
+        sin,
+        device,
+        context_len,
+        epochs=None,
     ):
-        from sgl_amd_mono.glm53.gfx950.config import HIDDEN
         from sgl_amd_mono.glm53.gfx950.runner import Glm53Step
 
         self.lm, self.model = lm, lm.model
-        self._layers, self.runtimes = layers, runtimes
-        self.first, self.last = min(layers), max(layers)
-        self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
+        self._layers, self.runtimes, self.heads = layers, runtimes, heads
+        # per width, the guard blocks of its runtimes: a step advances them at once
+        self.epochs = epochs
         self.max_position = context_len - 1
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
-        self.topk_cols = torch.arange(TOPK, dtype=torch.int64, device=device)
-        self.steps, self.pad_h = {}, {}
+        self.steps, self.ids = {}, {}
         i32, i64 = torch.int32, torch.int64
         for w in {w for w, _ in runtimes}:
             self.steps[w] = Glm53Step(
@@ -287,7 +423,22 @@ class _Built:
                 # the last entry takes the copies of a row's unused keys
                 topk=torch.zeros(w * TOPK + 1, dtype=i32, device=device),
             )
-            self.pad_h[w] = torch.zeros(w, HIDDEN, dtype=torch.bfloat16, device=device)
+            # layer 0's input: the step's token ids, -1 for a pad row
+            self.ids[w] = torch.full((w,), -1, dtype=i32, device=device)
+        # the logits processor returns the tail's logits on a routed step
+        lp = lm.logits_processor
+        self._own_logits, self._logits = lp._get_logits, None
+        lp._get_logits = self._get_logits
+
+    def _get_logits(self, hidden_states, lm_head, logits_metadata, *args, **kwargs):
+        """The logits processor's logits: the tail's on a routed step (f32 [rows,
+        vocab], as SGLang's LM head, all-gather and logits buffer leave them), else
+        its own."""
+        if self._logits is None:
+            return self._own_logits(
+                hidden_states, lm_head, logits_metadata, *args, **kwargs
+            )
+        return self._logits[: hidden_states.shape[0]]
 
     def forward(
         self,
@@ -300,127 +451,76 @@ class _Built:
     ):
         """``DeepseekV2ForCausalLM.forward`` for a routed decode or verify step."""
         lm = self.lm
-        if plan.key.rows > self.max_rows:
+        if input_embeds is not None:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden = self._backbone(
-                plan, input_ids, positions, forward_batch, input_embeds
+            normed, self._logits = self._backbone(
+                plan, input_ids, positions, forward_batch
             )
-        return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, None)
+        try:
+            # the logits processor stores the final norm's rows as SGLang's forward
+            # hands them over
+            return lm.logits_processor(
+                input_ids, normed, lm.lm_head, forward_batch, None
+            )
+        finally:
+            self._logits = None
 
-    def _backbone(self, plan, input_ids, positions, forward_batch, input_embeds):
-        """``DeepseekV2Model.forward``: the embedding and dense layers on SGLang's
-        path, the covered ones as launches, then the final norm."""
-        from sglang.srt.layers.layer_boundary.residual.batch import (
-            complete_output,
-            final_norm,
-            start,
-        )
-        from sglang.srt.utils.common import BumpAllocator
+    def _backbone(self, plan, input_ids, positions, forward_batch):
+        """``DeepseekV2Model.forward`` with every layer a launch, layer 0 from the
+        tokens, then the tail: the final norm's rows and the gathered logits."""
+        from sglang.srt.layers.layer_boundary.residual.batch import clear, start
 
-        m = self.model
-        hidden = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
         start(forward_batch)
-        zero = BumpAllocator(
-            buffer_size=(m.end_layer - m.start_layer) * 2,
-            dtype=torch.float32,
-            device=hidden.device,
-        )
-        gemm_zero = None
-        if m.gemm_output_zero_allocator_size > 0:
-            gemm_zero = BumpAllocator(
-                buffer_size=m.gemm_output_zero_allocator_size,
-                dtype=torch.float32,
-                device=hidden.device,
-            )
-        topk_indices = None
-        for i in range(m.start_layer, m.end_layer):
-            L = self._layers.get(i)
-            if L is not None:
-                hidden = self._layer(
-                    L, plan, positions, hidden, forward_batch, topk_indices
-                )
-                topk_indices = None
-                continue
-            hidden, topk_indices = m.layers[i](
-                positions,
-                hidden,
-                forward_batch,
-                zero,
-                gemm_zero,
-                None,
-                prev_topk_indices=topk_indices,
-                next_full_attention_layer_id=m.next_full_attention_layer_id.get(i),
-            )
-        hidden = complete_output(hidden, forward_batch)
-        if not forward_batch.forward_mode.is_idle():
-            hidden = final_norm(hidden, forward_batch, m.norm)
-        return hidden
-
-    def _layer(self, L: _Layer, plan, positions, hidden, forward_batch, topk_indices):
-        """The stream the previous layer wrote (the first covered layer) or the
-        previous launch's output in; the launch's output, or the written stream
-        after the last covered layer."""
-        from sglang.srt.layers.layer_boundary.residual.batch import (
-            fold,
-            set_written,
-            take_output,
-        )
-
         S = plan.key.rows
         W = _width(S)
-        step = self._step(plan, positions, forward_batch, S, W)
-        if L.i == self.first:
-            # layer 2's output still owes its residual add (to the next input norm)
-            h = take_output(fold(hidden, forward_batch), forward_batch)
-            if S < W:
-                pad = self.pad_h[W]
-                pad[:S].copy_(h)
-                pad[S:].zero_()
-                h = pad
-            if L.w.index is None:
-                self._take_topk(topk_indices, step, S, W)
-        else:
-            h = hidden
-        self._bind(L)
+        step = self._step(plan, input_ids, positions, forward_batch, S, W)
+        h = self.ids[W]
+        for i in sorted(self._layers):
+            h = self._layer(
+                self._layers[i], plan, input_ids, positions, h, forward_batch, step
+            )
+        logits, normed = self.heads[W].launch(h)
+        if self.check_layers and not torch.cuda.is_current_stream_capturing():
+            from sgl_amd_mono.glm53 import check
+
+            check.tail(self.lm, h[:S], logits[:S], normed[:S])
+        self.epochs[W].advance()
+        clear(forward_batch)
+        return normed[:S], logits
+
+    def _layer(self, L: _Layer, plan, input_ids, positions, h, forward_batch, step):
+        """The previous launch's output (layer 0: the token ids) in; the launch's
+        output out."""
+        S = plan.key.rows
+        W = _width(S)
+        self._bind(L, kv_dtype=L.ops[W].rt.kv_dtype)
         checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if checking:
             from sgl_amd_mono.glm53 import check
 
-            if L.i == self.first:
-                plan.state["ref_topk"] = topk_indices
+            x = self.model.embed_tokens(input_ids[:S]) if L.i == 0 else h[:S].clone()
             prev = None if L.w.index is not None else plan.state.get("ref_topk")
-            ref = check.reference(L, positions, h[:S].clone(), forward_batch, S, prev)
+            ref = check.reference(L, positions, x, forward_batch, S, prev)
             if ref["topk"] is not None:
                 plan.state["ref_topk"] = ref["topk"]
         out = L.ops[W].launch(h, L.caches, self.cos, self.sin, step)
         if checking:
-            check.compare(L, ref, out[:S], positions, forward_batch, S, step=step)
-        if L.i != self.last:
-            return out
-        for (w, _), rt in self.runtimes.items():
-            if w == W:
-                rt.advance_step()
-        return set_written(out[:S], forward_batch)
-
-    def _take_topk(self, topk_indices, step, S: int, W: int) -> None:
-        """Layer 2's top-k (SGLang's [S, 2048] KV slots, -1 past each row's keys)
-        into the compact buffer the next launch reads (row s at indptr[s])."""
-        if topk_indices is None:
-            raise RuntimeError("GLM-5.3 monokernel: no top-k from the layer before")
-        start = step.indptr[:S].to(torch.int64).unsqueeze(1)
-        count = (step.indptr[1 : S + 1] - step.indptr[:S]).to(torch.int64).unsqueeze(1)
-        dst = torch.where(self.topk_cols < count, start + self.topk_cols, W * TOPK)
-        step.topk.scatter_(
-            0, dst.reshape(-1), topk_indices[:S].reshape(-1).to(torch.int32)
-        )
+            rt = L.ops[W].rt
+            scores = check.launch_scores(rt, S) if L.w.index is not None else None
+            check.compare(
+                L, ref, out[:S], positions, forward_batch, S, step=step, scores=scores
+            )
+            if L.w.dense:
+                check.dense(L, L.ops[W], ref, out[:S], S)
+        return out
 
     @staticmethod
-    def _bind(L: _Layer) -> None:
+    def _bind(L: _Layer, kv_dtype: torch.dtype) -> None:
         from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
         from sgl_amd_mono.glm53.gfx950.runner import (
@@ -439,14 +539,11 @@ class _Built:
             and (idx is None or L.caches.idx.data_ptr() == idx.data_ptr())
         ):
             return
-        if (
-            kv.dtype != torch.bfloat16
-            or kv.shape[-1] != KV_ROW
-            or not kv.is_contiguous()
-        ):
+        # an E4M3 row is SGLang's HIP DSA layout: 576 values, no block scales
+        if kv.dtype != kv_dtype or kv.shape[-1] != KV_ROW or not kv.is_contiguous():
             raise RuntimeError(
                 f"GLM-5.3 monokernel: layer {L.i}: MLA cache {kv.dtype} "
-                f"{tuple(kv.shape)}; needs contiguous bf16 [slots, 1, {KV_ROW}]"
+                f"{tuple(kv.shape)}; needs contiguous {kv_dtype} [slots, 1, {KV_ROW}]"
             )
         if idx is not None and (idx.dtype != torch.uint8 or not idx.is_contiguous()):
             raise RuntimeError(
@@ -458,31 +555,29 @@ class _Built:
             idx=None if idx is None else idx.view(idx.shape[0], INDEX_PAGE_TOKENS, -1),
         )
 
-    def _step(self, plan, positions, forward_batch, S: int, W: int):
-        """The step's rows for every launch (``Glm53Step``): built once a step, in
-        the graph when captured."""
+    def _step(self, plan, input_ids, positions, forward_batch, S: int, W: int):
+        """The step's rows for every launch (``Glm53Step``) and layer 0's token ids:
+        built once a step (one launch, ``tables.step_rows``), in the graph when
+        captured. A row sees keys 0 ..= its position (in TARGET_VERIFY seq_lens holds
+        each request's prefix, not each row's keys); verify rows past the context are
+        lookahead the scheduler discards, and the rotary table and the indexer's
+        score rows end at the context."""
         if "step" not in plan.state:
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
+            from sgl_amd_mono.glm53 import tables
+
             st = self.steps[W]
-            loc = forward_batch.out_cache_loc[:S].to(torch.int64)
-            valid = loc != 0
-            st.slots[:S] = torch.where(valid, loc, -1)
-            st.slots[S:] = -1
-            # verify rows past the context are lookahead the scheduler discards; the
-            # rotary table and the indexer's score rows end at the context
-            pos = positions[:S].to(torch.int64).clamp(max=self.max_position)
-            st.positions[:S] = pos
-            st.positions[S:] = 0
-            # a row sees keys 0 ..= its position (in TARGET_VERIFY seq_lens holds
-            # each request's prefix, not each row's keys)
-            count = torch.where(valid, (pos + 1).clamp(max=TOPK), 0)
-            # indptr[0] stays 0 from its allocation
-            st.indptr[1 : S + 1] = torch.cumsum(count, 0, dtype=torch.int32)
-            st.indptr[S + 1 :] = st.indptr[S]
+            tables.step_rows(
+                st,
+                forward_batch.out_cache_loc,
+                positions,
+                S,
+                self.max_position,
+                ids_in=input_ids,
+                ids=self.ids[W],
+            )
             # the DSA backend repeats a verify request's page-table row for each row
-            st.req_ids[:S] = torch.arange(S, dtype=torch.int32, device=loc.device)
-            st.req_ids[S:] = 0
             md = get_attn_backend().forward_metadata
             plan.state["step"] = msgspec.structs.replace(
                 st, page_table=md.real_page_table[:S]
@@ -491,16 +586,23 @@ class _Built:
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    from sglang.srt.runtime_context import get_parallel, process_model_config
+    from sglang.srt.runtime_context import get_model, get_parallel, process_model_config
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.glm53.gfx950.layout import INDEX_KEYS_PER_TASK
     from sgl_amd_mono.glm53.gfx950.runner import (
         Glm53Build,
+        Glm53Epochs,
+        Glm53HeadOp,
         Glm53LayerOp,
         Glm53Runtime,
     )
-    from sgl_amd_mono.glm53.gfx950.weights import layer_weights, rope_tables
+    from sgl_amd_mono.glm53.gfx950.weights import (
+        embedding,
+        head_weights,
+        layer_weights,
+        rope_tables,
+    )
 
     p = get_parallel()
     tp, rank = p.tp_size, p.tp_rank
@@ -515,16 +617,46 @@ def _build(model, hf_config, ctx) -> _Built:
         )
         for i in covered
     }
+    emb = embedding(model, tp, rank)
+    vocab_rows = emb.shape[0]
+    head = head_weights(model, tp, rank)
+    if head.w_head.shape[0] != vocab_rows:
+        raise ValueError("GLM-5.3 monokernel: the LM head and embedding shards differ")
+    # layer 0 reads its embedding rows where a layer reads its router
+    layers[0].w = msgspec.structs.replace(layers[0].w, w_r=emb)
     cos, sin = rope_tables([model.model.layers[i] for i in covered], copies)
     shuffled = {L.w.shuffled for L in layers.values()}
     if len(shuffled) != 1:
         raise ValueError("GLM-5.3 monokernel: the layers' FP8 layouts differ")
     fp8_shuffled = shuffled.pop()
+    # Each kind's runtime takes its own layers' form, so the dense layers and the
+    # MoE ones need not agree: GLM-5.2's MXFP4 checkpoint keeps its dense MLPs in
+    # bf16 (copied as block FP8) next to MXFP4 experts. A dense MLP that is itself
+    # MXFP4 is the MXFP4 checkpoint's, whose rows run MXFP4 too.
+    dense_mxfp4 = any(L.w.mxfp4 for L in layers.values() if L.w.dense)
+    dense = {L.w.dense for L in layers.values() if L.w.dense}
+    if len(dense) > 1 or not layers[0].w.dense or layers[0].w.index is None:
+        raise ValueError(
+            "GLM-5.3 monokernel: needs layer 0 a dense indexer layer, every dense MLP "
+            "in one slicing"
+        )
+    # layer 0 (from the tokens) has its own runtime; the other dense layers share one
     kinds = {
-        "index": [i for i in covered if layers[i].w.index is not None],
+        "embed": [0],
+        "dense": [i for i in covered if i and layers[i].w.dense],
+        "index": [
+            i
+            for i in covered
+            if not layers[i].w.dense and layers[i].w.index is not None
+        ],
         "shared": [i for i in covered if layers[i].w.index is None],
     }
+    if any(layers[i].w.index is None for i in kinds["dense"]):
+        raise ValueError(
+            "GLM-5.3 monokernel: needs the dense layers to run the indexer"
+        )
     fault_site, fault_after = guard.fault_injection(rank) or (0, 0)
+    kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
     context_len = process_model_config().context_len
     # the copied table is SGLang's at build; a longer served context reads past it
     if cos.shape[0] < context_len:
@@ -535,41 +667,79 @@ def _build(model, hf_config, ctx) -> _Built:
     # the keys an indexer row scores at most: the served context's, in whole tasks
     tasks = -(-context_len // INDEX_KEYS_PER_TASK)
     max_seq = tasks * INDEX_KEYS_PER_TASK
-    cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
-    widths = sorted({_width(r) for r in ctx.widths if r <= cap})
-    if not widths:
-        raise ValueError(
-            f"GLM-5.3 monokernel: TP{tp} runs at most {cap} rows on the kernels, and "
-            f"this server's decode graphs route {sorted(ctx.widths)}"
+    widths = sorted({_width(r) for r in ctx.widths})
+    runtimes, heads = {}, {}
+    epochs = {w: Glm53Epochs(len(kinds) + 1, device) for w in widths}
+
+    def runtime(key):
+        rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device, epochs[key.rows])
+        # at most the guard's longest deadline, in whole seconds
+        rt.set_deadline(
+            _deadline(key, ctx.deadline_s, guard.MAX_DEADLINE_TICKS // guard.CLOCK_HZ)
         )
-    runtimes = {}
+        return rt
+
     # each runtime's peer handshake is collective: every rank builds them in one order
     for w in widths:
         for kind, ids in kinds.items():
+            if not ids:
+                continue
+            indexer = layers[ids[0]].w.index is not None
             key = Glm53Build(
                 rows=w,
                 tp=tp,
                 launches_per_step=len(ids),
-                with_indexer=kind == "index",
+                with_indexer=indexer,
                 # an unpaged launch keeps index_max_seq words in LDS
-                index_max_seq=max_seq if kind == "index" else 0,
+                index_max_seq=max_seq if indexer else 0,
                 fp8_shuffled=fp8_shuffled,
+                kv_fp8=kv_fp8,
                 fault_site=fault_site,
                 fault_after=fault_after,
+                dense=layers[ids[0]].w.dense,
+                tokens=kind == "embed",
+                vocab_rows=vocab_rows if kind == "embed" else 0,
+                mxfp4=layers[ids[0]].w.mxfp4,
+                # MXFP4 experts on MXFP8 rows (ATOM's layout, the FP4 MFMA): at 6
+                # rows and 64K keys 69 us a shared layer, the bf16 rows' dequant
+                # path 106 us. The MXFP4 checkpoint's own MLPs run MXFP4 rows.
+                native_fp4=layers[ids[0]].w.mxfp4 and not dense_mxfp4,
             )
-            rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device)
-            rt.set_deadline(ctx.deadline_s)
+            rt = runtime(key)
             runtimes[w, kind] = rt
             for n, i in enumerate(ids):
                 layers[i].ops[w] = Glm53LayerOp(rt, layers[i].w, n)
+        key = Glm53Build(
+            rows=w,
+            tp=tp,
+            launches_per_step=1,
+            with_indexer=False,
+            index_max_seq=0,
+            fp8_shuffled=fp8_shuffled,
+            fault_site=fault_site,
+            fault_after=fault_after,
+            head=True,
+            vocab_rows=vocab_rows,
+        )
+        runtimes[w, "head"] = rt = runtime(key)
+        heads[w] = Glm53HeadOp(rt, head)
     # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.
     start = len(widths) * rank // tp
     for w in widths[start:] + widths[:start]:
-        for kind in kinds:
-            runtimes[w, kind].precompile()
+        for (rw, _), rt in runtimes.items():
+            if rw == w:
+                rt.precompile()
     return _Built(
-        model, layers, runtimes, cos, sin, tp, device, context_len=context_len
+        model,
+        layers,
+        runtimes,
+        heads,
+        cos,
+        sin,
+        device,
+        context_len=context_len,
+        epochs=epochs,
     )
 
 
@@ -583,7 +753,7 @@ SPEC = MonoSpec(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),
         server_args={
-            "kv_cache_dtype": frozenset({"auto", "bfloat16"}),
+            "kv_cache_dtype": frozenset({"auto", "bfloat16", "fp8_e4m3"}),
             "moe_runner_backend": frozenset({"auto", "aiter"}),
             # MTP: the NextN draft's verify steps (NEXTN resolves to EAGLE)
             "speculative_algorithm": frozenset({None, "EAGLE"}),

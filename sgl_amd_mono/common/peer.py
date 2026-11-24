@@ -20,6 +20,10 @@ _IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
 _DEVICE_MALLOC_UNCACHED = 0x3
 # a peer maps an IPC handle in 2 MiB granules, so a partial last granule faults there
 _GRANULE = 2 << 20
+# closed buffers and their peer mappings, kept until the process exits: on MI355X, pages
+# a kernel had used uncached, once freed and reused by ordinary allocations, gave later
+# kernels stale cache lines (64-byte runs of zeros or older values)
+_RETIRED: list = []
 
 
 class PeerMemoryError(RuntimeError):
@@ -31,7 +35,7 @@ class _IpcHandle(ctypes.Structure):
 
 
 @functools.cache
-def _hip():
+def hip_runtime():
     """The HIP runtime this process loaded (torch's), not a second copy."""
     path = None
     with open("/proc/self/maps") as maps:
@@ -66,7 +70,7 @@ def _hip():
 
 def _check(err: int, what: str) -> None:
     if err:
-        msg = _hip().hipGetErrorString(err)
+        msg = hip_runtime().hipGetErrorString(err)
         raise RuntimeError(f"{what}: {msg.decode() if msg else err}")
 
 
@@ -74,17 +78,19 @@ def _alloc_uncached(nbytes: int) -> int:
     size = -(-nbytes // _GRANULE) * _GRANULE
     ptr = ctypes.c_void_p()
     _check(
-        _hip().hipExtMallocWithFlags(ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED),
+        hip_runtime().hipExtMallocWithFlags(
+            ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED
+        ),
         "hipExtMallocWithFlags",
     )
-    _check(_hip().hipMemset(ptr, 0, size), "hipMemset")
+    _check(hip_runtime().hipMemset(ptr, 0, size), "hipMemset")
     return int(ptr.value)
 
 
 def _handle(ptr: int) -> bytes:
     h = _IpcHandle()
     _check(
-        _hip().hipIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(ptr)),
+        hip_runtime().hipIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(ptr)),
         "hipIpcGetMemHandle",
     )
     return bytes(ctypes.string_at(ctypes.byref(h), _IPC_HANDLE_BYTES))
@@ -95,7 +101,7 @@ def _open(handle: bytes) -> int:
     ctypes.memmove(ctypes.byref(h), handle, _IPC_HANDLE_BYTES)
     out = ctypes.c_void_p()
     _check(
-        _hip().hipIpcOpenMemHandle(
+        hip_runtime().hipIpcOpenMemHandle(
             ctypes.byref(out), h, _IPC_MEM_LAZY_ENABLE_PEER_ACCESS
         ),
         "hipIpcOpenMemHandle",
@@ -120,7 +126,7 @@ class PeerBuffer:
     def __init__(self, nbytes: int, group, rank: int, npes: int, device: torch.device):
         self.rank = rank
         self.local = _alloc_uncached(nbytes)
-        # a view, not an owner: close() frees the memory under it
+        # a view, not an owner of the memory under it
         self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
         self._opened: list[int] = []
         addresses = [self.local]
@@ -153,11 +159,8 @@ class PeerBuffer:
         self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
 
     def close(self) -> None:
-        """Unmap the peers and free the local buffer (idempotent)."""
-        opened, self._opened = self._opened, []
-        for base in opened:
-            _hip().hipIpcCloseMemHandle(ctypes.c_void_p(base))
+        """Drop the buffer, keeping its memory and peer mappings in ``_RETIRED``
+        (idempotent)."""
         if self.local:
-            self.bytes = None
-            _hip().hipFree(ctypes.c_void_p(self.local))
-            self.local = 0
+            _RETIRED.append((self.local, self._opened))
+            self.bytes, self.local, self._opened = None, 0, []

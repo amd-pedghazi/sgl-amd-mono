@@ -60,10 +60,20 @@ FLAG_WORDS = 8  # one a rank; TP 8 at most
 FLAG_BYTES = 256  # the peer buffer's flags region, padded to a cache line pair
 
 CLOCK_HZ = 100_000_000  # s_memrealtime: the constant 100 MHz reference clock
+# a wait's check compares time in 2**TICK_SHIFT ticks (2.56 us), as 32-bit scalars
+TICK_SHIFT = 8
+# a longer deadline wraps in that check, and a wait fails at its first check
+MAX_DEADLINE_TICKS = (1 << 31 << TICK_SHIFT) - 1
 
 
 def deadline_ticks(seconds: float) -> int:
-    return int(seconds * CLOCK_HZ)
+    ticks = int(seconds * CLOCK_HZ)
+    if ticks > MAX_DEADLINE_TICKS:
+        raise ValueError(
+            f"a {seconds} s wait deadline does not fit the wait's 32-bit check; "
+            f"use at most {MAX_DEADLINE_TICKS // CLOCK_HZ} s"
+        )
+    return ticks
 
 
 def fault_injection(rank: int) -> Optional[tuple[int, int]]:
@@ -109,9 +119,13 @@ class Guard:
         fault_after=0,
         stop=True,
     ):
+        assert (own is None) == (peers is None), (
+            "own and peers come together: a rank reads the flags its peers write"
+        )
         self.epoch = epoch
         self.own = own
         self.peers = peers
+        self.has_peers = peers is not None
         self.rank = rank
         self.npes = npes
         self.flags_offset = flags_offset
@@ -144,6 +158,17 @@ class Guard:
         )
         return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
 
+    def scalar_deadline(self):
+        """The deadline >> ``TICK_SHIFT`` in an SGPR, so a wait's check needs no VGPRs.
+
+        The host writes it before the launch, so the scalar cache may serve it; a GLC
+        load slows the launch's other scalar loads."""
+        w = fx.Vector(bo.buffer_load(rsrc(self.epoch), 0, vec_width=4, is_scalar=True))
+        dl = (fx.Int64(w[GUARD_DEADLINE + 1]) << 32) | (
+            fx.Int64(w[GUARD_DEADLINE]) & fx.Int64(0xFFFFFFFF)
+        )
+        return fx.Int32(dl >> TICK_SHIFT)
+
     def next_site(self) -> int:
         self._sites += 1
         return self._sites
@@ -157,7 +182,7 @@ class Guard:
 
     def flags(self):
         """This rank's flags as its peers wrote them (system scope); 0 when clean."""
-        if self.own is None:
+        if not self.has_peers:
             return fx.Int32(0)
         acc = fx.Int32(0)
         # a buffer load carries at most 4 dwords: TP 8 reads its flags in two
@@ -189,7 +214,7 @@ class Guard:
         bo.buffer_store(
             fx.Int32(site + 1), rsrc(self.epoch), ERR_DEADLINE, cache_modifier=CM_DEV
         )
-        if self.peers is not None:
+        if self.has_peers:
             for p in range_constexpr(self.npes):
                 bo.buffer_store(
                     fx.Int32(1),
