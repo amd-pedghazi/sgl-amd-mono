@@ -104,14 +104,11 @@ SGLANG_READS = {
         "forward_mode",
         "batch_size",
         "input_ids",
+        "is_draft_extend_v2",
+        "is_decode",
         "reuse_dsa_topk_indices",
         "out_cache_loc",
         "sampling_info",
-    ),
-    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
-    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
-        "is_draft_extend_v2",
-        "is_decode",
     ),
     "srt/sampling/sampling_batch_info.py": ("is_all_greedy",),
     "srt/speculative/*.py": (
@@ -547,10 +544,16 @@ def _build(model, hf_config, ctx):
         )
     max_seq = -(-context_len // INDEX_KEYS_PER_TASK) * INDEX_KEYS_PER_TASK
     kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
-    extend_widths = sorted(ctx.widths)
+    cap = target.TP_MAX_ROWS.get(tp, max(target.WIDTHS))
+    extend_widths = sorted(w for w in ctx.widths if w <= cap)
     # a draft decode step of 5 to 8 rows runs SGLang's path: the NextN shared launch
     # at 8 rows faulted in a kernel check (a process of several launches, not alone)
-    decode_widths = [w for w in target.WIDTHS if w <= 4]
+    decode_widths = [w for w in target.WIDTHS if w <= min(cap, 4)]
+    if not extend_widths:
+        raise ValueError(
+            f"GLM-5.3 MTP draft: TP{tp} runs at most {cap} rows, and this server's "
+            f"draft extend steps have {sorted(ctx.widths)}"
+        )
     layer = target._Layer(layer_id, decoder, weights)
     shared_w = msgspec.structs.replace(weights, index=None)
     widths = sorted(set(extend_widths) | set(decode_widths))

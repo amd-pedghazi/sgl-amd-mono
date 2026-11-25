@@ -681,12 +681,9 @@ SPEC = MonoSpec(
         "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)
     },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
-    # the launcher checks the target's requirements; the draft's attention backend is
-    # its own. Other targets' DFlash2 drafts share the architecture and model type:
-    # the hidden size tells this one apart, and SGLang runs another's normal forward.
+    # the launcher checks the target's requirements; the draft's attention backend is its own
     requires=Requirements(
-        attention_backends=frozenset({"triton"}),
-        hf_config={"model_type": "qwen3", "hidden_size": DRAFT_CONFIG["hidden_size"]},
+        attention_backends=frozenset({"triton"}), hf_config={"model_type": "qwen3"}
     ),
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,
