@@ -9,7 +9,7 @@
 # result.json, which report.py judges). The job fetches the commits under test
 # itself; from here it takes only this directory, the base branch's CI scripts.
 #
-# Usage: slurm_launch.sh MODEL [TIER]   (TIER: full, the default, or smoke)
+# Usage: slurm_launch.sh MODEL [TIER]   (TIER: full, the default, smoke or tests)
 #
 # Runner environment (its .env):
 #   SLURM_PARTITION, SLURM_ACCOUNT, SLURM_QOS

@@ -14,14 +14,15 @@ supports, and nightly against SGLang main.
 
 import ast
 from functools import lru_cache
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
-import sglang
 
 import sgl_amd_mono
 
-ROOT = Path(sglang.__file__).resolve().parent  # the installed sglang package
+# Inspect the source without importing SGLang and its runtime dependencies.
+ROOT = Path(find_spec("sglang").origin).resolve().parent
 PACKAGE = Path(sgl_amd_mono.__file__).resolve().parent
 
 

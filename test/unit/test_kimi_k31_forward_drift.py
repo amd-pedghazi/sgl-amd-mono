@@ -1,11 +1,12 @@
 """The Kimi-K3.1 forward that kimi_k31 reproduces for a routed step, pinned by
-source digest on the SGLang Kimi-K3.1 is served with (dev_amd, e67b2062e2).
+source digest on SGLang main (fbb46d0fab, which merged the Kimi-K3.1 branch).
 
 ``wide.Wide.backbone`` reproduces the backbone, and ``Wide._tail_front`` a DSA
 layer's forward up to its MoE's TP partials; the outer forwards are Kimi-K3's
 ``_Built``, pinned in test_kimi_k3_forward_drift.py. The layer forward's MegaMoE and CP-shard MLP branches and the causal-LM
 forward's CP branch are not taken by a routed verify step (no MoE a2a backend, CP
-only on context-parallel extends).
+only on context-parallel extends), nor are its KDA DWDP hooks or the sequence-parallel
+branches (PD prefill and extends only).
 """
 
 import hashlib
@@ -15,8 +16,8 @@ import pytest
 from sglang.srt.models import kimi_k3
 
 PINNED = {
-    ("KimiK3LinearModel", "forward"): ("9a6d94921969be24", "wide.Wide.backbone"),
-    ("KimiK3DecoderLayer", "forward"): ("04f140797269349c", "wide.Wide._tail_front"),
+    ("KimiK3LinearModel", "forward"): ("de1b4a8b58f8678a", "wide.Wide.backbone"),
+    ("KimiK3DecoderLayer", "forward"): ("373da46f0dd3bf07", "wide.Wide._tail_front"),
 }
 
 

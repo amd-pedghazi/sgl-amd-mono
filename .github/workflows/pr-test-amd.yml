@@ -3,16 +3,18 @@ name: PR Test (AMD)
 # The PR test of the review guideline: per model the PR touches, its unit, kernel and
 # serving tests, accuracy (sgl-eval) and InferenceX fixed-length speed against the
 # base branch, and the kernel-only timing scripts, on dedicated MI355X nodes. A run
-# takes hours, so a maintainer starts it: add the `run-ci` label (removed again when
-# the run starts, so a later push needs a maintainer again), or run this workflow
-# with a PR number. `run-ci-extra` runs the same and adds GPQA, which catches the
-# long-context losses GSM8K cannot (a PR that touches attention, the KV cache or
-# long sequences should get it). The result is the "AMD PR test" status on the PR's head commit
-# and a sticky PR comment; see scripts/ci/README.md.
+# takes hours, so a maintainer starts it: add the `run-ci` label, or run this workflow
+# with a PR number. The label stays: every later push to the PR runs the test again,
+# until a maintainer removes it. `run-ci-extra` runs the same and adds GPQA, which
+# catches the long-context losses GSM8K cannot (a PR that touches attention, the KV
+# cache or long sequences should get it). The result is the "AMD PR test" status on the PR's head commit
+# and a sticky PR comment; see scripts/ci/README.md. A PR without either label
+# gets the status as failed ("add the run-ci label"), set from a GitHub-hosted
+# runner, so every PR has it and none merges without a maintainer starting the test.
 
 on:
   pull_request_target:
-    types: [labeled]
+    types: [opened, reopened, synchronize, labeled]
   workflow_dispatch:
     inputs:
       pr:
@@ -33,10 +35,14 @@ permissions:
   contents: read
 
 concurrency:
-  # Only runs that test: other label events must not cancel one.
+  # Only runs that test: other label events, and pushes to a PR without the label,
+  # must not cancel one. A new push cancels the run on the PR's previous head.
   group: >-
     ${{ (github.event_name == 'workflow_dispatch'
-         || github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-extra')
+         || github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-extra'
+         || github.event.action != 'labeled'
+            && (contains(github.event.pull_request.labels.*.name, 'run-ci')
+                || contains(github.event.pull_request.labels.*.name, 'run-ci-extra')))
         && format('pr-test-amd-{0}', github.event.pull_request.number || inputs.pr)
         || github.run_id }}
   cancel-in-progress: true
@@ -45,10 +51,54 @@ env:
   STATUS_CONTEXT: AMD PR test
 
 jobs:
+  # Decides from the PR's labels whether this event runs the test. Without run-ci
+  # or run-ci-extra it fails the status and the run here, on a GitHub-hosted
+  # runner: nothing reaches the AMD runners. Another label added to a PR that has
+  # one changes nothing (the test of its head already ran or is running). The
+  # labels are read live, as a re-run does not refresh the event's.
+  gate:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - name: Check the labels
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+          README: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.repository.default_branch }}/scripts/ci/README.md
+        run: |
+          labels="$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name')"
+          if grep -qxE 'run-ci|run-ci-extra' <<< "$labels"; then
+            run=true
+            [[ "$ACTION" == labeled && "$LABEL" != run-ci && "$LABEL" != run-ci-extra ]] && run=false
+            echo "run=$run" >> "$GITHUB_OUTPUT"
+            echo "PR #$PR has the label; run the test: $run"
+            exit 0
+          fi
+          echo "run=false" >> "$GITHUB_OUTPUT"
+          gh api "repos/$REPO/statuses/$SHA" -f state=failure -f context="$STATUS_CONTEXT" \
+            -f description="Not run: adding the run-ci label starts a new run (re-running this one does not)" \
+            -f target_url="$README" > /dev/null
+          # A re-run keeps this event's labels, and the runners' job-start hook reads
+          # those, so it would refuse the test even with the label added since.
+          echo "::error::The AMD PR test runs only on a PR with the 'run-ci' (or 'run-ci-extra') label, which a maintainer adds. Adding it starts a new run; do not re-run this one."
+          exit 1
+
   plan:
+    needs: gate
+    # !cancelled(): a dispatched run skips the gate.
     if: >-
-      github.event_name == 'workflow_dispatch'
-      || github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-extra'
+      !cancelled()
+      && (github.event_name == 'workflow_dispatch' || needs.gate.outputs.run == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -61,7 +111,7 @@ jobs:
       pr_sha: ${{ steps.pr.outputs.pr_sha }}
       base_sha: ${{ steps.pr.outputs.base_sha }}
       image: ${{ steps.image.outputs.image }}
-      extra: ${{ github.event.label.name == 'run-ci-extra' || inputs.extra || false }}
+      extra: ${{ contains(github.event.pull_request.labels.*.name, 'run-ci-extra') || inputs.extra || false }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,11 +120,13 @@ jobs:
 
       - name: Resolve the PR
         id: pr
+        # pipefail: a failed file list must stop the run, not scope it to `common`
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number || inputs.pr }}
-          # On a label event, the head the maintainer saw when labelling.
+          # On a label or push event, the head the event carries.
           EVENT_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           gh api "repos/$REPO/pulls/$PR" > pr.json
@@ -93,13 +145,6 @@ jobs:
             echo "base_sha=$base_sha"
           } >> "$GITHUB_OUTPUT"
           echo "PR #$PR head $pr_sha, base $base_ref at $base_sha: $(cat title.txt)"
-
-      - name: Remove the label that started the run
-        if: github.event_name == 'pull_request_target'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LABEL: ${{ github.event.label.name }}
-        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/labels/$LABEL" || true
 
       # Read only: scope.py looks for model READMEs; nothing from the PR runs here.
       - uses: actions/checkout@v4
@@ -152,6 +197,9 @@ jobs:
 
   test:
     needs: plan
+    # The gate a dispatched run skips is upstream of this job too, and a skipped
+    # job anywhere upstream skips it unless its condition says otherwise.
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     name: test (${{ matrix.model }}, ${{ matrix.tier }})
     # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
     # each job takes one of the two CI nodes.
@@ -192,6 +240,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Judge
+        # bash (not the default bash -e) runs with pipefail: a failed check fails
+        # the model's job instead of passing through tee's exit status
+        shell: bash
         run: |
           python3 harness/scripts/ci/report.py --results "$RESULTS" --model "${{ matrix.model }}" \
             --title-type "${{ needs.plan.outputs.title_type }}" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -206,7 +257,7 @@ jobs:
 
   report:
     needs: [plan, test]
-    # Not on a cancelled run: a newer run (a new label) has taken over the status.
+    # Not on a cancelled run: a newer run (a new label or push) has taken over the status.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:

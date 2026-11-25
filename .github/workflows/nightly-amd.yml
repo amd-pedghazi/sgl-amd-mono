@@ -1,7 +1,8 @@
 name: Nightly (AMD)
 
 # main on the newest SGLang ROCm image, each nightly model (`nightly` in
-# scripts/ci/models.py): its tests, accuracy benchmarks and speed test.
+# scripts/ci/models.py; the weekly run adds the `weekly` models): its tests,
+# accuracy benchmarks and speed test.
 # Sunday to Friday, the nightly runs the monokernels on only, skips the `weekly`
 # benchmarks (AIME26 x4) and holds the scores to each model's fixed `baseline`.
 # Saturday's weekly run has every benchmark with the monokernels on and off; its
@@ -58,7 +59,7 @@ jobs:
           if [[ -n "$MODELS" ]]; then
             matrix="$(jq -cn --arg m "$MODELS" '$m | split(",") | map(gsub(" "; "")) | map(select(length > 0)) | map({model: ., tier: "full"})')"
           else
-            matrix="$(python3 scripts/ci/models.py nightly)"
+            matrix="$(python3 scripts/ci/models.py "$mode")"
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -118,6 +119,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Judge
+        # bash (not the default bash -e) runs with pipefail: a failed check fails
+        # the model's job instead of passing through tee's exit status
+        shell: bash
         run: |
           python3 harness/scripts/ci/report.py --results "$RESULTS" --model "${{ matrix.model }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"

@@ -861,12 +861,15 @@ def main() -> int:
     ap.add_argument("--dump", default="", help="write the digests into DIR")
     ap.add_argument("--perturb", action="store_true", help="negate one input value")
     ap.add_argument("--similar", type=float, default=0.0, help="rows routing alike")
-    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 MLPs")
     ap.add_argument("--compare", nargs=2, metavar=("A_DIR", "B_DIR"))
     ap.add_argument(
         "--positions", default="", help="comma-separated live-row positions"
     )
-    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 (A4W4) MoE experts")
+    ap.add_argument(
+        "--mxfp4",
+        action="store_true",
+        help="MXFP4 MLPs: the MoE experts (A4W4) and dense MLP",
+    )
     ap.add_argument(
         "--native-fp4", action="store_true", help="MXFP8 x MXFP4 MFMA (with --mxfp4)"
     )

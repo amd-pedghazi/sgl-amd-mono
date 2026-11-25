@@ -37,6 +37,17 @@ def acquire_loads():
     llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
 
 
+def udiv(a, b):
+    """a // b of nonnegative int32 values as an unsigned division (no floor fixups:
+    the same quotient in about half the scalar instructions)."""
+    return fx.Int32(fx.Uint32(a) // (b if isinstance(b, int) else fx.Uint32(b)))
+
+
+def umod(a, b):
+    """a % b of nonnegative int32 values (unsigned)."""
+    return fx.Int32(fx.Uint32(a) % (b if isinstance(b, int) else fx.Uint32(b)))
+
+
 # ---------------------------------------------------------------- stage trace
 TRACE_SLOTS = 16  # stamps a CTA: int64 clock ticks (100 MHz) at trace[((layer % TRACE_LAYERS) BLOCKS + bid) TRACE_SLOTS + idx]
 TRACE_LAYERS = 64  # a layer's own stamp slots (``c["layer"]``): a server snapshot keeps every layer's last launch
@@ -44,10 +55,10 @@ TRACE_BLOCKS = 256  # CTAs a launch (``common.plan.BLOCKS``)
 
 
 @flyc.jit
-def stamp(c, idx: int):
+def stamp(c, idx: int, who: int = 0):
     """Trace stamp ``idx`` of this CTA, compiled in by a build with ``trace``: the
     100 MHz realtime clock, an int64 in the launch's ``*_trace`` scratch region
-    (``c["trace"]``, a pair a stamp), written by thread 0."""
+    (``c["trace"]``, a pair a stamp), written by thread ``who``."""
     if const_expr(not c.get("trace_on", False)):
         return
     layer = c.get("layer")
@@ -57,7 +68,7 @@ def stamp(c, idx: int):
         base = (layer % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS) + c[
             "bid"
         ] * TRACE_SLOTS
-    if c["tid"] == 0:
+    if c["tid"] == who:
         now = clock()
         addr = c["trace"].value + fx.Int64((base + idx) * 8)
         ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result

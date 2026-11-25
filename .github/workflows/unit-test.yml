@@ -1,0 +1,43 @@
+name: Unit Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out the SGLang source for the contract tests
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          ref: ba76f34b85a4b77d765ab96a82e3cc6eb804cb96
+          path: .ci/sglang
+          sparse-checkout: python/sglang
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python -m pip install pytest
+
+      - name: Run the CPU contract tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.ci/sglang/python
+        run: python -m pytest test/unit/test_contract.py -q

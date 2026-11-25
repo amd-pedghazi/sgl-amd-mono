@@ -7,12 +7,13 @@ context)."""
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
+from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol
-from sgl_amd_mono.common.ops import peer_bases
+from sgl_amd_mono.common.ops import peer_bases, read_lane_i32, rsrc
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
@@ -49,6 +50,29 @@ class K3Build(msgspec.Struct, frozen=True):
     ug_dyn: bool = False  # the ug items past each CTA's first from a launch-wide queue (``k3_ugq``; merged + xq_pre)
 
 
+class _LazyPeers:
+    """Every rank's region ``off`` of the peer buffers (``preg``), the base read at the
+    use from the table loaded a 32-bit half a lane at K3's entry (``k3_context``): its
+    round trip is never waited for at the entry (the users, the fin / unpool pushes,
+    run long after it landed)."""
+
+    def __init__(self, pv, npes, off, region):
+        self.pv, self.npes, self.off, self.region = pv, npes, off, region
+
+    def __len__(self):
+        return self.npes
+
+    def __getitem__(self, p):
+        assert isinstance(p, int) and 0 <= p < self.npes, p
+        lo = read_lane_i32(self.pv, 2 * p)
+        hi = read_lane_i32(self.pv, 2 * p + 1)
+        base = (fx.Int64(hi) << 32) | fx.Int64(fx.Uint32(lo))
+        return preg(base, self.off, self.region)
+
+    def __iter__(self):
+        return (self[p] for p in range(self.npes))
+
+
 def k3_context(
     key: K3Build,
     lds,
@@ -68,8 +92,23 @@ def k3_context(
     s, npes = key.tokens, key.npes
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
-    bases = peer_bases(peers, npes)
     ffn_off, unp_off = sym_layout["ffn"][0], sym_layout["unp"][0]
+    if not key.tpx and 2 * npes <= 64:
+        # the peer bases a lane each, read at their use; lane i: word i of the bases table (no wait here: see ``_LazyPeers``)
+        pv = fx.Int32(
+            bo.buffer_load(
+                rsrc(peers),
+                fx.min(tid % 64, fx.Int32(2 * npes - 1)),
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        peer_ffn = _LazyPeers(pv, npes, ffn_off, "ffn")
+        peer_unp = _LazyPeers(pv, npes, unp_off, "unp")
+    else:
+        bases = peer_bases(peers, npes)
+        peer_ffn = [preg(base, ffn_off, "ffn") for base in bases]
+        peer_unp = [preg(base, unp_off, "unp") for base in bases]
     c = {
         "S": s,
         "W": npes,
@@ -89,6 +128,8 @@ def k3_context(
         "put_bf": mb.put_bf,
         "put_words": mb.put_words,
         "poll": mb.poll,
+        "poll_issue": mb.poll_issue,
+        "poll_wait": mb.poll_wait,
         "args": args,
         "rank": rank,
         "last": key.last,
@@ -99,8 +140,8 @@ def k3_context(
         "ar_parts": ffn.ar_parts(s),
         "own_ffn": preg(sym, ffn_off, "ffn"),
         "own_unp": preg(sym, unp_off, "unp"),
-        "peer_ffn": [preg(base, ffn_off, "ffn") for base in bases],
-        "peer_unp": [preg(base, unp_off, "unp") for base in bases],
+        "peer_ffn": peer_ffn,
+        "peer_unp": peer_unp,
         "tpx": key.tpx,
         "defer_k1": key.defer_k1,
         "xq_pre": key.xq_pre,
@@ -109,7 +150,7 @@ def k3_context(
     }
     if key.tpx:
         c.update(ffn.tpx_dims(npes))
-        for region in ("midx", "vx", "ssx", "scx"):
+        for region in ("midx", "vx", "ssx"):
             off = sym_layout[region][0]
             c["own_" + region] = preg(sym, off, region)
             c["peer_" + region] = [preg(base, off, region) for base in bases]

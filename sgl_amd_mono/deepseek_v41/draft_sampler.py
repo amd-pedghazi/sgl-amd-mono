@@ -17,7 +17,13 @@ ENV = "SGLANG_AMD_MONO_DSV41_MARKOV"
 # by file under sglang/ (test_contract.py pins them)
 SGLANG_READS = {
     "kernels/plugin_kernels/nvidia/spec.py": ("draft_sampler", "graph_variants"),
-    "srt/kernel_plugins/nvidia/binding.py": ("built_megakernel", '"_megakernel"'),
+    "srt/kernel_plugins/nvidia/binding.py": (
+        "built_megakernel",
+        '"_megakernel"',
+        # _InstalledMegakernel's fields, which _Entries stands in for
+        "tensor_entry",
+        "binding",
+    ),
     "srt/models/deepseek_v4_dspark.py": (
         "DSparkV4MarkovHead",
         "compute_base_logits",
@@ -61,6 +67,9 @@ class _Entries:
     draft_loop = draft_extend = begin_draft_round = graph_variants = None
     # current SGLang reads .built and .prepare of the entry, older SGLang the entry itself
     prepare = None
+    # SGLang's decode graph capture reads .tensor_entry (None: no tensor entry) and
+    # prepare_megakernel .binding, as of _InstalledMegakernel's tensor_entry field
+    tensor_entry = binding = None
 
     def __init__(self, draft_sampler):
         self.draft_sampler = draft_sampler

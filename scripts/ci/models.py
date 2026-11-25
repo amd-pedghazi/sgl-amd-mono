@@ -2,7 +2,8 @@
 
 A PR runs the entries whose ``packages`` it touches; a change to ``common/``,
 ``sgl_amd_mono/__init__.py`` or ``pyproject.toml`` runs all of them. The nightly
-runs the entries marked ``nightly`` on main. Each entry
+runs the entries marked ``nightly`` on main, and the weekly run (Saturdays)
+those and the ones marked ``weekly``. Each entry
 names the server its accuracy and speed tests launch (a recipe module under
 ``test/e2e`` and its argument list, or ``env`` / ``args`` given here), the
 checkpoints on the CI nodes, its kernel and serving tests, its kernel-only
@@ -41,6 +42,7 @@ CHECKPOINTS = [
         "Inferact/MiniMax-M3-EAGLE3-GQA",
         "MiniMaxAI/MiniMax-M3.1-Flash",
         "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+        "Qwen/Qwen3.5-397B-A17B-FP8",
         "amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8",
         "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
         "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4",
@@ -99,6 +101,15 @@ EXTRA_EVALS = ["gpqa"]
 # ``BASELINE_MARGIN``) to copy into the model's entry.
 BASELINE_MARGIN = {"gsm8k": 0.015, "gpqa": 0.05, "aime26": 0.03, "mmmu_pro": 0.03}
 TEXT_EVALS = ["gsm8k", "gpqa", "aime26"]
+
+
+def weekly_eval(model: dict, name: str) -> bool:
+    """Whether benchmark ``name`` of ``model`` runs only in the weekly run: a
+    ``weekly`` benchmark, or one the model's ``weekly_evals`` lists (a benchmark
+    too slow for the nightly at the model's concurrency)."""
+    return bool(EVALS[name].get("weekly")) or name in model.get("weekly_evals", ())
+
+
 # One-sided significance level of the GSM8K test.
 ALPHA = 0.05
 
@@ -234,8 +245,6 @@ MODELS = {
         "baseline": {},
         "packages": ["glm53_flash"],
         "tp": 4,
-        # amd/GLM-5.3-Flash-Quark-MXFP4: not on shared storage; downloaded by hand
-        # into both nodes' mirror
         "paths": {"GLM_53_FLASH_MODEL_PATH": f"{HF}/amd/GLM-5.3-Flash-Quark-MXFP4"},
         "recipe": ("glm53_flash_server", "ARGS"),
         "kernel_tests": ["test/kernels/test_glm53_flash_kernels.py"],
@@ -271,6 +280,9 @@ MODELS = {
             "torchrun --nproc-per-node 8 test/kernels/kimi_k3/time_k2.py --rows 8 --flush 1024"
         ],
         "evals": TEXT_EVALS + ["mmmu_pro"],
+        # one request at a time, MMMU-Pro takes ~8 h and held a CI node for most of
+        # the nightly; it runs in the weekly run only
+        "weekly_evals": ["mmmu_pro"],
         # the recipe runs one request a step (DSpark verify steps of 8 rows)
         "concurrency": [1],
         "gate_concurrency": [1],
@@ -326,6 +338,29 @@ MODELS = {
         "concurrency": [],
         "gate_concurrency": [],
     },
+    "qwen35_a17b_fp8": {
+        "name": "Qwen3.5-397B-A17B (FP8)",
+        # the weekly run only (Saturdays), to keep the nightly's two nodes free
+        "weekly": True,
+        # set from the first weekly report
+        "baseline": {},
+        "packages": ["qwen35_a17b"],
+        "tp": 4,
+        "paths": {"QWEN35_FP8_MODEL_PATH": f"{HF}/Qwen/Qwen3.5-397B-A17B-FP8"},
+        # InferenceX MI355X FP8: EAGLE, 3 steps, top-1, 4 draft tokens; ARGS_CI
+        # lifts its 9236-token context so the accuracy benchmarks fit
+        "recipe": ("qwen35_a17b_fp8_mtp_server", "ARGS_CI"),
+        "kernel_tests": ["test/kernels/test_qwen35_a17b_fp8_verify.py"],
+        "e2e_tests": [
+            "test/e2e/test_qwen35_a17b_fp8_server.py",
+            "test/e2e/test_qwen35_a17b_fp8_mtp_server.py",
+        ],
+        "microbench": [],
+        "evals": TEXT_EVALS,
+        # EAGLE verify steps of 4 rows a request: 8 requests fill the 32-row width
+        "concurrency": [1, 2, 4, 8],
+        "gate_concurrency": [1, 8],
+    },
     "qwen38_flash_next": {
         "name": "Qwen3.8-Flash-Next (MXFP4)",
         # Phase 1 of the nightly
@@ -334,8 +369,6 @@ MODELS = {
         "baseline": {},
         "packages": ["qwen38_flash_next"],
         "tp": 1,
-        # amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8: not on shared storage;
-        # downloaded by hand into both nodes' mirror
         "paths": {
             "QWEN38_FLASH_NEXT_MODEL_PATH": f"{HF}/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8"
         },
@@ -383,11 +416,16 @@ if __name__ == "__main__":
     # `python3 models.py checkpoints`: every supported checkpoint, one a line
     elif sys.argv[1:] == ["checkpoints"]:
         print("\n".join(CHECKPOINTS))
-    # `python3 models.py nightly` (the weekly run's too): the nightly's matrix, as JSON
-    elif sys.argv[1:] == ["nightly"]:
+    # `python3 models.py nightly|weekly`: the run's matrix, as JSON. The weekly run
+    # has the nightly's models and those marked ``weekly`` (weekly run only).
+    elif sys.argv[1:] in (["nightly"], ["weekly"]):
         import json
 
-        keys = ["common", *(k for k, m in MODELS.items() if m.get("nightly"))]
+        keys = ["common"] + [
+            k
+            for k, m in MODELS.items()
+            if m.get("nightly") or (sys.argv[1] == "weekly" and m.get("weekly"))
+        ]
         print(json.dumps([{"model": k, "tier": "full"} for k in keys]))
     else:
-        sys.exit("usage: models.py paths MODEL | checkpoints | nightly")
+        sys.exit("usage: models.py paths MODEL | checkpoints | nightly | weekly")

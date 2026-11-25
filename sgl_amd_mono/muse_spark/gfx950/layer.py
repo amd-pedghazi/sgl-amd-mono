@@ -12,11 +12,12 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import CM_DEV
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
-from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.common.sync import Mailbox, shift, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import LAYER_SLOTS, MAX_TOKENS
 from sgl_amd_mono.muse_spark.gfx950.device import global_atomic, step_tag
 from sgl_amd_mono.muse_spark.gfx950.layout import (
+    X_FLAG_COPIES,
     attn_rows,
     k1_scratch_layout,
     kattn_scratch_layout,
@@ -214,6 +215,7 @@ def kattn_context(
         **attention.lds_views(*_attn_views(lds)),
         "put": mb.put,
         "poll": mb.poll,
+        "tag": tag,
         "args": args,
         "trace_on": key.trace,
         "layer": layer,
@@ -319,25 +321,6 @@ def build_kattn(key: KAttnBuild):
     return launch
 
 
-def k1_late(tokens: int, npes: int) -> list:
-    """A merged launch's CTAs that reach the next K1 late, [(first CTA, count)]: the
-    boundary CTAs and, where the others can hold their tiles, the active unpool CTAs
-    (``ffn.k3_bases``); the GEMV spreads over the others (``pre_attn.spread_tiles``)."""
-    from sgl_amd_mono.muse_spark.gfx950.stages import ffn
-    from sgl_amd_mono.muse_spark.gfx950.stages.pre_attn import spread_max_tiles
-
-    b = ffn.k3_bases(tokens, npes)
-    late = [(0, tokens), (b["unp0"], b["unp_jobs"])]
-    if b["unp0"] + b["unp_jobs"] > BLOCKS or spread_max_tiles(late) > SPREAD_TILES_MAX:
-        late = late[
-            :1
-        ]  # (wider steps: the unpool CTAs keep their part; the registers cap a CTA's tiles)
-    return late
-
-
-SPREAD_TILES_MAX = 14  # row tiles a CTA's GEMV holds in flight at most (two VGPR quads a tile and k-step)
-
-
 class LayerBuild(msgspec.Struct, frozen=True):
     """A whole-layer build: the step's row count and rows a request, the TP / EP
     size, whether the next layer's K1 ends the launch, whether the FFN boundary is
@@ -363,7 +346,6 @@ class LayerBuild(msgspec.Struct, frozen=True):
     pshard: bool = (
         False  # the pooler sharded by rows over the ranks (K2Build.pshard; npes == 8)
     )
-    kshard: bool = False  # the K-sharded boundary (K2Build.kshard; with pshard, 8 rows at npes == 8)
     kind: str = (
         ""  # "sliding": the sliding layers' own build (KAttnBuild.kind); "": any layer
     )
@@ -444,7 +426,7 @@ def build_layer(key: LayerBuild):
         and QL in (1, 8)
         and 1 <= W <= guard.FLAG_WORDS
     )
-    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16), ps=int(key.pshard), ks=int(key.kshard), **({"k": key.kind} if key.kind else {}), **({"hm": key.kv_rows} if key.kv_rows else {}), **({"hs": key.swa_rows} if key.swa_rows else {}), **({"pf": 1} if key.pf and next_k1 else {}))  # fmt: skip
+    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16), ps=int(key.pshard), **({"k": key.kind} if key.kind else {}), **({"hm": key.kv_rows} if key.kv_rows else {}), **({"hs": key.swa_rows} if key.swa_rows else {}), **({"pf": 1} if key.pf and next_k1 else {}))  # fmt: skip
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
     defer = key.defer_k1 and next_k1
@@ -475,7 +457,6 @@ def build_layer(key: LayerBuild):
         defer,
         xq,
         key.pshard,
-        key.kshard,
     )
     ugd = (
         key.ug_dyn and xq and S >= 16
@@ -585,7 +566,7 @@ def build_layer(key: LayerBuild):
             ca = kattn_context(
                 ka_key, lds, a_args, scratch_a, tag, ka_layout, layer=layer
             )
-            attention.run_kattn(ca, o_flag=oflag)
+            attention.run_kattn(ca, o_flag=oflag, og=c2["og"])
             gpu.barrier()  # this CTA is done with the attention's LDS
             post_attn.run_k2(
                 c2, route_flag=rflag, xin_flag=xinflag, o_flag=oflag, QL=QL
@@ -621,12 +602,20 @@ def build_layer(key: LayerBuild):
                     merged=True,
                     layer=layer + 1,
                 )
-                c1["late"] = k1_late(S, W)
                 if const_expr(defer):
                     # the unpooled rows and the scalars are this layer's (K3's tag)
                     c1.update(
                         d_poll=c3["poll"], d_unp=c3["own_unp"], d_nscal=c3["nscal"]
                     )
+                else:
+                    # K3's tail issues the K1 GEMV weights of the CTAs it keeps
+                    # longest (``ffn.stage_unpool``): their own task, or none (past
+                    # the last task: zeros, no traffic)
+                    def k1_pre(early):
+                        return pre_attn.gemv_w_loads_if(c1, bid, w1, early)
+
+                    c3["k1_pre"] = k1_pre
+                    c3["k1_units_pre"] = lambda early: pre_attn.units_pre_if(c1, early)
                 ffn.run_k3(
                     c3,
                     route_flag=rflag,
@@ -634,25 +623,32 @@ def build_layer(key: LayerBuild):
                     x_flag=c1["xflag"],
                     x_put=c1["put"],
                     res_flag=(c2["resflag"], S * post_attn.a_parts(S)),
-                    ids_mb=c2["idx"],
-                    sc_mb=c3.get("own_scx"),
                 )
                 gpu.barrier()
+                if const_expr(c3.get("k1_w") is not None):
+                    c1.update(
+                        k1_w=c3["k1_w"],
+                        k1_early=c3["k1_early"],
+                        k1_units=c3["k1_units"],
+                    )
+                # this CTA's copy of the x flags (``layout.X_FLAG_COPIES``)
+                x_copy = shift(
+                    c1["xflag"],
+                    fx.Int64(fx.Int32(bid % X_FLAG_COPIES) * (MAX_TOKENS * 8)),
+                )
                 if const_expr(pf):
                     prefetch_code(
                         scratch1 + fx.Int64(pf_entry(S, 0)) + fx.Int64(layer) * 16,
                         pfl.peek().buf.ptr,
                         bid,
                     )
-                pre_attn.run_k1(c1, bid, x_flag=c1["xflag"])
+                pre_attn.run_k1(c1, bid, x_flag=x_copy)
             else:
                 ffn.run_k3(
                     c3,
                     route_flag=rflag,
                     xin_flag=xinflag,
                     res_flag=(c2["resflag"], S * post_attn.a_parts(S)),
-                    ids_mb=c2["idx"],
-                    sc_mb=c3.get("own_scx"),
                 )
 
     @flyc.jit

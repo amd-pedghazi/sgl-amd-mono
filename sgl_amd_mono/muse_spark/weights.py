@@ -533,16 +533,26 @@ class LayerViews(msgspec.Struct, frozen=True):
         )
 
 
+# The order a tile-shuffled tile stores a wave's 4 KB slab in, as the bits of (register
+# j1, j0, lane bit 5 .. 0): the ``mxfp4.FP4_LOAD_LAYOUT`` ("a8f") lane map's labels (r: the
+# tile's row bits, k: the 64 B chunk's, g: the 16 B piece's). ``ffn`` asserts the match.
+TILE_ORDER = ("k1", "r0", "g1", "k0", "r3", "r2", "r1", "g0")
+
+
 def tile_shuffle(t: torch.Tensor) -> torch.Tensor:
-    """Packed MXFP4 rows [E, rows, 2048 B] re-laid a 16-row tile at a time as [wave 8][chunk
-    4][lane 64][16 B] (lane = 16 x byte group + row of the tile): the bytes a K3 lane loads
-    (``ffn.fp4_tile_loads``) unchanged, a wave's load of a chunk 1 KB contiguous instead of
-    16 rows x 64 B (measured 18% faster streaming)."""
+    """Packed MXFP4 rows [E, rows, 2048 B] re-laid a 16-row tile at a time as [wave 8]
+    [register 4][lane 64][16 B] in ``TILE_ORDER``: the bytes a K3 lane loads into each
+    register (``ffn.fp4_tile_loads``, the FP4_LOAD_LAYOUT lane map) unchanged, a wave's
+    load of a register 1 KB contiguous instead of whole lines spread over the tile's rows
+    (#142 measured the contiguous form 18% faster streaming)."""
     E, R, B = t.shape
     assert R % 16 == 0 and B == 2048, (R, B)
+    # the row-major tile's dims: rows r3 .. r0, then wave, k1, k0, g1, g0, the 16 bytes
+    src = ("r3", "r2", "r1", "r0", "wave", "k1", "k0", "g1", "g0")
+    perm = [0, 1, 2 + src.index("wave")] + [2 + src.index(x) for x in TILE_ORDER] + [11]
     return (
-        t.view(E, R // 16, 16, 8, 4, 4, 16)
-        .permute(0, 1, 3, 4, 5, 2, 6)
+        t.view(E, R // 16, 2, 2, 2, 2, 8, 2, 2, 2, 2, 16)
+        .permute(*perm)
         .contiguous()
         .view(E, R, B)
     )

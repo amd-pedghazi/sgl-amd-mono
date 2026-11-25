@@ -130,9 +130,6 @@ UG_DYN = os.environ.get("SGLANG_AMD_MONO_MUSE_UG_DYN", "1") == "1"
 # the pooler sharded by rows over the 8 ranks (Kimi-K3's latent projection): 8.4 MB a layer a rank instead of 67;
 # the partial pooled rows go to every rank (=0: the replicated pooler)
 PSHARD = os.environ.get("SGLANG_AMD_MONO_MUSE_PSHARD", "1") == "1"
-# with PSHARD, at 8 rows: the K-sharded boundary (K2Build.kshard): the o all-reduce as a reduce-scatter
-# to the K eighths' owners, the pooler and router as each rank's K eighth of every row (=0: the row shards)
-KSHARD = os.environ.get("SGLANG_AMD_MONO_MUSE_KSHARD", "1") == "1"
 # the bf16-expert layers (0 and 61) on K1 / the attention / K2, then SGLang's bf16 experts and FFN boundary
 # (=0: SGLang's whole layer)
 BF16_K2 = os.environ.get("SGLANG_AMD_MONO_MUSE_BF16_K2", "1") == "1"
@@ -214,7 +211,6 @@ class MuseMonoRunner:
         from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import (
             k2_scratch_layout,
             sym_bytes,
-            sym_init,
         )
 
         _ensure_writable_flydsl_cache()
@@ -227,7 +223,6 @@ class MuseMonoRunner:
         self.tpx = TPX and USE_KERNELS
         self.tpx_w = None  # the TP-experts slices: built at bind, after SGLang sized the KV cache
         self.pool_rows = None  # the sharded pooler's row slices a layer: built at bind
-        self.kslices = None  # the K-sharded boundary's (pooler, router hi, router lo) K eighths a layer: built at bind
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         self.use_kernels = USE_KERNELS
         self.use_layer = USE_LAYER
@@ -269,7 +264,6 @@ class MuseMonoRunner:
             sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev
         )
         self.peers.bytes.zero_()
-        sym_init(self.peers.bytes, npes)
         # layers 0 / 61's FP8 TP-expert FFN as one launch (tpx_fp8x.build_fused): its gathered mids / y
         # (tagged pairs) and the plain y it leaves in their own peer buffer (sized for the largest step it
         # serves, 16 rows)
@@ -362,7 +356,6 @@ class MuseMonoRunner:
                     trace=bool(TRACE_DIR),
                     fp8_pool=self.fp8_dense,
                     pshard=self._pshard(rows),
-                    kshard=self._kshard(rows),
                 )
             )
         return self._k2[rows]
@@ -406,7 +399,6 @@ class MuseMonoRunner:
                         xq_pre=XQ_PRE,
                         ug_dyn=UG_DYN,
                         pshard=self._pshard(rows),
-                        kshard=self._kshard(rows),
                         kind=kind,
                         kv_rows=self.kv_rows,
                         swa_rows=self.swa_rows,
@@ -493,24 +485,16 @@ class MuseMonoRunner:
         replicated pooler)."""
         return self.pshard and rows <= 16
 
-    def _kshard(self, rows: int) -> bool:
-        """The K-sharded boundary at this width: 8 rows (``K2Build.kshard``)."""
-        return KSHARD and self._pshard(rows) and rows == 8
-
     def _pool_w(self, i: int, rows: int):
-        """Layer i's pooler for K2: the rank's K eighth or row slice (sharded), the FP8 copy, or the weight."""
+        """Layer i's pooler for K2: the rank's row slice (sharded), the FP8 copy, or the weight."""
         L = self.views[i]
-        if self._kshard(rows):
-            return self.kslices[i][0]
         if self._pshard(rows):
             return self.pool_rows[i]
         return L.w_pool_fp8 if self.fp8_dense else L.w_pool
 
     def _router_w(self, i: int, rows: int) -> tuple:
-        """Layer i's router (hi, lo) for K2: the rank's K eighths (K-sharded) or the whole."""
+        """Layer i's router (hi, lo) for K2."""
         L = self.views[i]
-        if self._kshard(rows):
-            return self.kslices[i][1], self.kslices[i][2]
         return L.gate_hi, L.gate_lo
 
     def _experts(self, i: int) -> tuple:
@@ -647,13 +631,6 @@ class MuseMonoRunner:
             n = MOE_HIDDEN // self.npes
             self.pool_rows = [
                 v.w_pool[self.rank * n : (self.rank + 1) * n].contiguous() if self._k2_layer(v) else None for v in self.views
-            ]  # fmt: skip
-        if KSHARD and self.pshard and self.kslices is None:
-            k = HIDDEN // self.npes
-            ks = slice(self.rank * k, (self.rank + 1) * k)
-            self.kslices = [
-                tuple(w[:, ks].contiguous() for w in (v.w_pool, v.gate_hi, v.gate_lo)) if self._k2_layer(v) else None
-                for v in self.views
             ]  # fmt: skip
         if TRACE_DIR:
             # the pinned host buffers before any capture (no host allocation inside

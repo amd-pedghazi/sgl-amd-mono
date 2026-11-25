@@ -1,4 +1,4 @@
-"""Qwen3.5-397B-A17B block-FP8 with --monokernel-backend amd and MTP on MI355X, TP4.
+"""Qwen3.5-397B-A17B block-FP8 with --enable-amd-monokernel and MTP on MI355X, TP4.
 
 The EAGLE draft runs SGLang's forward; target-verify steps of 1 to 8 requests
 x 4 draft tokens run the new kernels. A 12-way GSM8K run steps past that and
@@ -35,8 +35,6 @@ from test_qwen35_a17b_fp8_server import (
     _visible_devices,
 )
 
-from sgl_amd_mono import BACKEND
-
 DRAFT_TOKENS = 4
 # ARGS keeps the 8k1k benchmark's context; GSM8K answers may take 32768 tokens
 EVAL_CONTEXT = ["--context-length", "40960"]
@@ -50,7 +48,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )

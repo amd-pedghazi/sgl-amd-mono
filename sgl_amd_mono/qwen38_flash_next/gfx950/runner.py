@@ -57,7 +57,9 @@ SGLANG_READS = {
         "get_key_buffer",
         "get_value_buffer",
     ),
-    "srt/mem_cache/kv/router.py": ("read", "view", "view_layer_id", '"state"'),
+    "srt/mem_cache/kv/router.py": ("read", "view", "view_layer_id"),
+    # STATE_PART, the GDN states' part name
+    "srt/mem_cache/kv/decl.py": ('"state"',),
     "srt/mem_cache/ple_state_pool.py": (
         "context",
         "intermediate_context",

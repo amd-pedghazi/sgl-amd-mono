@@ -22,7 +22,10 @@ then the model's serving tests. A model whose ``models.py`` entry merged before
 its package has no base package; its off side runs the speed test as its base.
 (A model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
 because shared code changed) runs no accuracy benchmark, whose bound its serving
-tests hold, and times only the gate concurrencies.
+tests hold, and times only the gate concurrencies. The tests tier (only the model's
+tests changed) runs its unit, kernel and serving tests: no base side, speed test or
+accuracy benchmark. A PR's kernel tests run with MONO_CI_QUICK_KERNELS=1, at the
+widths each test picks as representative; the nightly and weekly run every width.
 
 Nightly mode (``--pr`` and ``--base`` both main): the tests, then the on side with
 the model's benchmarks but the weekly ones, and the speed test. It runs no off
@@ -63,6 +66,7 @@ from models import (  # noqa: E402
     PR_EVALS,
     PROMPTS_PER_SLOT,
     RANGE_RATIO,
+    weekly_eval,
 )
 
 PORT = 31000
@@ -566,6 +570,7 @@ class Run:
             self.step("pinned", self.pinned, serve=self.key != "common" and not why)
         if a.mode == "pr":
             self.step("base-tests", self.base_tests)
+            os.environ["MONO_CI_QUICK_KERNELS"] = "1"
         if self.key == "common":
             self.install(a.pr)
             self.pytest("unit", ["test/unit"], 1800)
@@ -581,7 +586,7 @@ class Run:
                 evals = [
                     e
                     for e in self.m.get("evals", [])
-                    if a.mode == "weekly" or not EVALS[e].get("weekly")
+                    if a.mode == "weekly" or not weekly_eval(self.m, e)
                 ]
                 self.step("on", self.side, "on", True, evals=evals)
                 if a.mode == "weekly":
@@ -589,6 +594,13 @@ class Run:
                     self.step("off", self.side, "off", False, evals=evals, fresh=True)
                 else:
                     self.step("off", self.read_monokernel_off_ref, evals, perf=True)
+                self.step("e2e", self.e2e)
+            return
+
+        if a.tier == "tests":
+            self.install(a.pr)
+            self.step("tests", self.tests)
+            if not why:
                 self.step("e2e", self.e2e)
             return
 
@@ -784,7 +796,7 @@ def main():
         required=True,
         help="persistent: pip, datasets, the monokernel-off reference",
     )
-    ap.add_argument("--tier", choices=("full", "smoke"), default="full")
+    ap.add_argument("--tier", choices=("full", "smoke", "tests"), default="full")
     ap.add_argument("--mode", choices=("pr", "nightly", "weekly"), default="pr")
     ap.add_argument(
         "--base-tests-only",

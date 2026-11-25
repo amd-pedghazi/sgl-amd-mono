@@ -1,4 +1,4 @@
-"""Qwen3.5-397B-A17B block-FP8 with --monokernel-backend amd on MI355X, TP4.
+"""Qwen3.5-397B-A17B block-FP8 with --enable-amd-monokernel on MI355X, TP4.
 
 Decode steps of 1 to 8 rows run the new kernels. A 12-way GSM8K run steps past
 that and back onto the standard path. Covered decode rows are scored again by
@@ -25,8 +25,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
-
-from sgl_amd_mono import BACKEND
 
 LAUNCH_TIMEOUT = 3600
 GSM8K_BOUND = 0.90
@@ -73,7 +71,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )

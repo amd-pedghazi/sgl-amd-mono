@@ -461,7 +461,7 @@ def main():
             if any((t[others].float() != sentinel).any().item() for t in outs):
                 fails.append(f"M={M} token parallel wrote another rank's rows")
     if rank == 0:
-        print(f"replay check: {args.replays} replays of widths {WIDTHS} in one graph: "
+        print(f"replay check: {args.replays} replays of widths {widths} in one graph: "
               f"{bad_replays} mismatching checks; allocator capture {capture} B (control {control}), "
               f"replays {replays} B", flush=True)  # fmt: skip
     if bad_replays:

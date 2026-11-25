@@ -41,16 +41,17 @@ SGLANG_READS = {
         "_route_quant_fuse_eligible",
     ),
     # the new dev_amd moved KimiK3MoE's ROCm paths into kimi_k3_amd
+    # NextAttnRead.max_tokens: the row cap of SGLang's column tail, which
+    # _column_exit must not exceed
     "srt/models/kimi_k3_amd/moe.py": (
+        "max_tokens",
         "_vector_aligned",
         "_forward_shared_casting_routed",
         "_forward_routed_a8w4",
     ),
-    # the row cap of SGLang's column tail, which _column_exit must not exceed; and
     # _launch_topk_ok: when SGLang's top-k post-processing is a no-op
     "srt/environ.py": (
         "envs",
-        "SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS",
         "SGLANG_SIMULATE_UNIFORM_EXPERTS",
         "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
     ),
@@ -882,14 +883,13 @@ class Wide:
         read. None, before anything runs, when SGLang's kernels do not take the batch."""
         import sglang.kernels.ops.attention.k3_attn_res_read_hip as hip
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
-        from sglang.srt.environ import envs
         from sglang.srt.layers.attn_residual_hip import gather_covers
 
         read = moe.next_attn_read
         if (
             read is None
             # _column_tail_and_next_read's own cap: past it, it would decline after the all-reduce
-            or rows > envs.SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS.get()
+            or rows > read.max_tokens
             or not moe._fused_latent_tail_eligible
         ):
             return None

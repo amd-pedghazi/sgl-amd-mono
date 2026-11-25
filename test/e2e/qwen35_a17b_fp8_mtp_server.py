@@ -50,3 +50,15 @@ ARGS = [
     "--watchdog-timeout",
     "1200",
 ]
+
+# The CI's server (scripts/ci/models.py): the same flags with room for the
+# accuracy benchmarks' answers (up to 64K tokens; 9236 rejects every request), and
+# the Qwen3 reasoning parser so the scored answer is not read from the thinking.
+ARGS_CI = [
+    *ARGS[: ARGS.index("--context-length")],
+    "--context-length",
+    "131072",
+    *ARGS[ARGS.index("--context-length") + 2 :],
+    "--reasoning-parser",
+    "qwen3",
+]

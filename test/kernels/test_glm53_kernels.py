@@ -19,6 +19,7 @@ bitwise (``glm53/check_nextn.py``). With MXFP4 MLPs: each
 launch kind's MLP against the AITER ops SGLang runs (``glm53/check_mxfp4.py``), the
 cache writes, the graph replays and the NextN launches as above."""
 
+import os
 import subprocess
 import sys
 import unittest
@@ -42,12 +43,24 @@ NEXTN = Path(__file__).with_name("glm53") / "check_nextn.py"
 MXFP4 = Path(__file__).with_name("glm53") / "check_mxfp4.py"
 # the widths the spec builds at each TP size
 WIDTHS = {4: "2,4,8", 8: "2,4,8"}
+# The PR test (MONO_CI_QUICK_KERNELS=1) checks every TP size at its first and last
+# width (2 and 8: each side of the paired launch, S >= 4); the nightly checks every
+# width.
+
+
+def _widths() -> dict:
+    if os.environ.get("MONO_CI_QUICK_KERNELS"):
+        return {
+            tp: ",".join(dict.fromkeys((rows.split(",")[0], rows.split(",")[-1])))
+            for tp, rows in WIDTHS.items()
+        }
+    return WIDTHS
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
 class TestMonoGlm53Kernels(CustomTestCase):
     def _check(self, *args: str, script: Path = CHECK) -> None:
-        for tp, rows in WIDTHS.items():
+        for tp, rows in _widths().items():
             cmd = [
                 sys.executable,
                 "-m",

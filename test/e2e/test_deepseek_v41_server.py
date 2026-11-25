@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1-Flash with --monokernel-backend amd on MI35x, TP4, across the switch points.
+"""DeepSeek-V4.1-Flash with --enable-amd-monokernel on MI35x, TP4, across the switch points.
 
 DSpark verify steps (8 requests of 6 rows at the largest width) and plain decode steps (48 rows):
 startup lines show the tested batches run the monokernels, GSM8K steps past the largest width and
@@ -35,8 +35,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
-
-from sgl_amd_mono import BACKEND
 
 LAUNCH_TIMEOUT = 3600
 # the normal path scores 0.88 to 0.91 on this recipe: the bound is for gross failures
@@ -95,7 +93,7 @@ def _launch(args=ARGS, extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=args + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=args + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )

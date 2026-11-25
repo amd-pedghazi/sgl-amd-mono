@@ -325,33 +325,49 @@ def test_config_reasons_name_each_mismatch():
     assert "FP8 block-128" in " ".join(glm53._config_disable_reasons(CFG, bf16))
 
 
-MXFP4 = {"dtype": "fp4", "group_size": 32, "scale_format": "e8m0"}
+# amd/GLM-5.2-MXFP4's global_quant_config (the fields the spec reads)
+MXFP4 = {
+    "dtype": "fp4",
+    "qscheme": "per_group",
+    "group_size": 32,
+    "scale_format": "e8m0",
+    "is_dynamic": False,
+}
+MXFP4_INPUTS = {**MXFP4, "is_dynamic": True}
 
 
 def test_glm52s_quark_mxfp4_checkpoint_is_served():
     quark = {
         "quant_method": "quark",
-        "global_quant_config": {"weight": MXFP4, "input_tensors": MXFP4},
+        "global_quant_config": {"weight": MXFP4, "input_tensors": MXFP4_INPUTS},
         "layer_quant_config": {},
     }
     glm52 = SimpleNamespace(**{**vars(GLM53), "quantization_config": quark})
     assert glm53._config_disable_reasons(CFG, glm52) == []
-    fp8_inputs = {**MXFP4, "dtype": "fp8_e4m3"}
+    fp8_inputs = {**MXFP4_INPUTS, "dtype": "fp8_e4m3"}
     other = {
         **quark,
         "global_quant_config": {"weight": MXFP4, "input_tensors": fp8_inputs},
     }
     glm52 = SimpleNamespace(**{**vars(GLM53), "quantization_config": other})
-    assert "Quark MXFP4" in " ".join(glm53._config_disable_reasons(CFG, glm52))
+    reasons = " ".join(glm53._config_disable_reasons(CFG, glm52))
+    assert "needs the MXFP4 checkpoint" in reasons
 
 
 def _mxfp4_moe(shuffled=True, scale_dims=3):
-    w13 = torch.empty(257, 4, 8, dtype=torch.uint8)
+    # zeros, not empty: a failing assertion prints these, and the CI compares it
+    w13 = torch.zeros(257, 4, 8, dtype=torch.uint8)
     if shuffled:
         w13.is_shuffled = True
-    scale = torch.empty((257, 4, 1)[3 - scale_dims :], dtype=torch.uint8)
+    scale = torch.zeros((257, 4, 1)[3 - scale_dims :], dtype=torch.uint8)
+    runner = SimpleNamespace(runner_backend=MoeRunnerBackend.AITER)
     return SimpleNamespace(
-        experts=SimpleNamespace(w13_weight=w13, w13_weight_scale=scale)
+        experts=SimpleNamespace(
+            w13_weight=w13,
+            w13_weight_scale=scale,
+            moe_runner_config=SimpleNamespace(activation="silu"),
+            quant_method=SimpleNamespace(runner=runner),
+        )
     )
 
 

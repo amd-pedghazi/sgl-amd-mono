@@ -25,6 +25,7 @@ from sgl_amd_mono.common.ops import (
 )
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
+MASK_OOB = 0x7FFFFFF0  # a masked poll's buffer size (bytes): its skipped loads' offset
 CHECK_POLLS = 64  # a pending wait checks its deadline and the failure flags this often
 
 
@@ -103,6 +104,37 @@ def _spin(load_all, pending, guarded=True, first=None):
         fail(site)
     if stop == 2:
         note_peer()
+    return v
+
+
+@flyc.jit
+def _spin_masked(load, pending, gap, first=None):
+    """``_spin`` whose re-polls load only what is still pending: ``load(v)`` re-loads
+    the specs of ``v`` not yet current (``load(None)``: every spec; ``first``: its
+    words, issued already). The wait a guard bounds as ``_spin``'s stopping branch
+    does; a fault-injection site or an unguarded wait re-polls every spec as
+    ``_spin`` does."""
+    g = guard.current()
+    if const_expr(g is None or not g.stop or g.fault_site == g._sites + 1):
+        return _spin(lambda: load(None), pending, first=first)
+    site = g.next_site()
+    scalar_deadline, has_peers = g.scalar_deadline, g.has_peers
+    stopped, fail, note_peer = g.stopped, g.fail, g.note_peer
+    v = _first_load(lambda: load(None), first)
+    t0 = fx.Int64(0)
+    polls = fx.Int32(0)
+    while pending(v):
+        rocdl.s_sleep(gap)
+        v = load(v)
+        polls = uniform(polls + 1)
+        if (polls & (CHECK_POLLS - 1)) == 0:
+            now = guard.clock()
+            t0 = (polls == CHECK_POLLS).select(now, t0)
+            if fx.Int32((now - t0) >> guard.TICK_SHIFT) > scalar_deadline():
+                fail(site)
+            if const_expr(has_peers):
+                if stopped():
+                    note_peer()
     return v
 
 
@@ -185,6 +217,58 @@ class Mailbox:
             return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
         load_all, pending, unpack = self._batch(specs)
         return unpack(_spin(load_all, pending))
+
+    def poll_masked(self, specs, gap=1, limit=POLL_MAX):
+        """``poll(specs)`` (one batch) whose re-polls skip the specs already current:
+        their loads read past the buffer (no traffic), so a wait on many producers
+        re-reads only the late ones' words instead of every word every round (a wide
+        wait's re-polls at full width flood the fabric). ``limit``: the specs a batch
+        may hold (its live registers)."""
+        assert 0 < len(specs) <= limit, len(specs)
+        spaces = {a.space for a, _, _ in specs}
+        assert len(spaces) == 1, f"one poll batch spans {spaces}"
+        cm = _SCOPE_CM[spaces.pop()]
+        bases = [a.value for a, _, _ in specs]
+        tag = self.tag
+        _, pending, unpack = self._batch(specs)
+
+        def load(prev):
+            # every spec's load issued before any select: the selects into the loop's
+            # registers otherwise each waited for their load (a round trip a spec)
+            ws, dones, e = [], [], 0
+            for b, (_, i, n) in zip(bases, specs):
+                off = fx.Int32(i) * 2
+                if const_expr(prev is not None):
+                    done = prev[e + 1] == tag
+                    for q in range_constexpr(1, n):
+                        done = done & (prev[e + 2 * q + 1] == tag)
+                    off = done.select(fx.Int32(MASK_OOB // 4), off)
+                    dones.append(done)
+                ws.append(
+                    fx.Vector(
+                        bo.buffer_load(
+                            rsrc(b, MASK_OOB),
+                            off,
+                            vec_width=2 * n,
+                            dtype=T.i32,
+                            cache_modifier=cm,
+                        )
+                    )
+                )
+                e += 2 * n
+            if const_expr(prev is not None):
+                rocdl.sched_barrier(0)
+            words, e = [], 0
+            for k, (_, _, n) in enumerate(specs):
+                for q in range_constexpr(2 * n):
+                    if const_expr(prev is None):
+                        words.append(ws[k][q])
+                    else:
+                        words.append(dones[k].select(prev[e + q], ws[k][q]))
+                e += 2 * n
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        return unpack(_spin_masked(load, pending, gap))
 
     def poll_issue(self, specs):
         """Issue the first loads of ``poll(specs)`` (at most ``POLL_MAX``) now, ahead of

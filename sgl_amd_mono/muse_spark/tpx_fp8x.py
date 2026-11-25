@@ -33,9 +33,12 @@ from sgl_amd_mono.common.ops import (
     rsrc,
     uniform,
 )
+from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import _spin
 from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.device import step_tag
+
+SOURCES = kernel_sources(__name__)
 
 BRIDGE = compat.install()
 _STREAM = fx.Stream(None)
@@ -292,6 +295,7 @@ def build_fused(
           ``lay["yout"]``) for the next launch (Triton's _fin); the launch's end is the barrier.
     Reuse across launches is safe: a peer's next-launch stores into this rank's mids / y need this rank's next launch
     started (its dn polls this rank's next mids), and this launch ends only after its last read."""
+    keyed = key_tuple(locals(), SOURCES)
     NP = M * TOPK
     lay = fused_layout(M, TOPK, RS, CS, W)
     BLOCKS = 256
@@ -499,6 +503,7 @@ def build_fused(
         dbg: Int64 = 0,
         stream: fx.Stream = _STREAM,
     ):
+        _ = keyed
         k(x, ids_p, w13, s13, w2, s2, sym, table, rank, ep, layer, dbg).launch(
             grid=(BLOCKS,), block=(WPB * 64,), stream=stream
         )
@@ -543,6 +548,7 @@ def build(
     """``kind`` "dn": y[pick, n] = bf16(sum_k mids[pick, k] w2[e, n, k]), K = I, the mids gathered [TP, NP, RS];
     "ug": mid[pick, n] = bf16(silu(g) u), g / u over w13's gate row n / up row ROWS + n, K = H, A = x [M, H].
     ROWS = the output rows a rank (CS for dn, RS for ug)."""
+    keyed = key_tuple(locals(), SOURCES)
     NT = ROWS // 16
     JOBS = NP * NT
     BLOCKS = -(-JOBS // WPB)
@@ -721,6 +727,7 @@ def build(
         xa_bytes: Int32,
         stream: fx.Stream = _STREAM,
     ):
+        _ = keyed
         k(xa, ids_p, w, s, out, xa_bytes).launch(
             grid=(BLOCKS,), block=(WPB * 64,), stream=stream
         )

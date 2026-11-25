@@ -9,9 +9,10 @@
 # (slurm_launch.sh). Each instance is a systemd --user service; the host reaps a
 # user's sessions at logout, so this needs `loginctl enable-linger`.
 #
-#   bash runner.sh install N                download the runner into rN and write its .env
-#                                           (needs SLURM_PARTITION, CI_NODE_SCRATCH and
-#                                           CI_MODEL_ROOT; see slurm_launch.sh)
+#   bash runner.sh install N                download the runner into rN, copy the job-start
+#                                           hook and write rN's .env (needs SLURM_PARTITION,
+#                                           CI_NODE_SCRATCH and CI_MODEL_ROOT; see slurm_launch.sh)
+#   bash runner.sh hook                     copy job_started_hook.sh again (after it changes)
 #   bash runner.sh register N [REPO_URL]    register rN (default https://github.com/sgl-project/sgl-amd-mono);
 #                                           reads a registration token on stdin
 #   bash runner.sh start|stop|restart N
@@ -29,6 +30,14 @@ ROOT="${MONO_RUNNER_ROOT:-/var/tmp/sgl-amd-mono-runner-$(id -un)}"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT=sgl-amd-mono-runner
 LABELS=sgl-amd-mono-mi355x
+# Outside every runner's _work, so that no checkout replaces it. (It does not
+# keep a job out: every job runs as this account, which owns it.)
+HOOK="$ROOT/job_started_hook.sh"
+
+copy_hook() {
+  mkdir -p "$ROOT"
+  install -m 755 "$(dirname "$(readlink -f "$0")")/job_started_hook.sh" "$HOOK"
+}
 
 write_env() {
   local dir=$1
@@ -41,6 +50,8 @@ write_env() {
     echo "CI_NODE_SCRATCH=$CI_NODE_SCRATCH"
     echo "CI_MODEL_ROOT=$CI_MODEL_ROOT"
     echo "CI_SHARED_DIR=$HOME/.sgl_amd_mono_ci"
+    # Refuses every job but the PR test (with run-ci) and the nightly from main.
+    echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$HOOK"
     # The scheduler client config the login shell sets; a systemd service starts without it.
     env | grep -E '^SPUR_(CLUSTER_NAME|CONTROLLER_ADDR|AUTH_PLUGIN)=' || true
   } > "$dir/.env"
@@ -85,7 +96,7 @@ case "$cmd" in
       curl -sSfL --max-time 600 \
         "https://github.com/actions/runner/releases/download/v$v/actions-runner-linux-x64-$v.tar.gz" | tar xz -C "$d"
     fi
-    write_env "$d"; write_unit
+    copy_hook; write_env "$d"; write_unit
     echo "$i: runner $("$d/bin/Runner.Listener" --version) in $d" ;;
   register)
     i=$(inst "${1:?instance}"); url=${2:-https://github.com/sgl-project/sgl-amd-mono}; d="$ROOT/$i"
@@ -96,6 +107,8 @@ case "$cmd" in
     (cd "$d" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh --unattended --replace \
        --url "$url" --name "mono-ci-$i" --labels "$LABELS" --work _work)
     systemctl --user enable --now "$UNIT@$i" ;;
+  hook)
+    copy_hook; echo "hook: $HOOK" ;;
   start|stop|restart)
     i=$(inst "${1:?instance}")
     [[ "$cmd" == start ]] && systemctl --user enable "$UNIT@$i"
@@ -113,5 +126,5 @@ case "$cmd" in
       printf '%-4s registered=%-60s service=%s\n' "$i" \
         "$reg" "$(systemctl --user is-active "$UNIT@$i" 2>/dev/null)"
     done ;;
-  *) sed -n '2,23p' "$0"; exit 1 ;;
+  *) sed -n '2,24p' "$0"; exit 1 ;;
 esac

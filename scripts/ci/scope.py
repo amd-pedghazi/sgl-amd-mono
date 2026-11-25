@@ -45,25 +45,38 @@ def package_of(path: str):
 
 def models_for(files):
     """The models a file list runs: {model: (why, tier)}. A model whose own package
-    changed runs the full tier; shared code runs every other model's smoke tier
-    (its tests and the speed test at its gate concurrencies; the serving tests
-    hold a GSM8K bound) and ``common`` (the unit and common kernel tests), which
-    also runs when no model changed."""
+    code (``sgl_amd_mono/<pkg>/``) changed runs the full tier; shared code runs
+    every other model's smoke tier (its tests and the speed test at its gate
+    concurrencies; the serving tests hold a GSM8K bound) and ``common`` (the unit
+    and common kernel tests), which also runs when no model changed. A model whose
+    tests changed but not its code runs the tests tier: its unit, kernel and
+    serving tests, no speed test or accuracy benchmark, which would measure the
+    same kernels as the base branch."""
     changed = [f["filename"] for f in files]
-    touched = {p for f in changed if (p := package_of(f))}
+    code = {
+        p for f in changed if f.startswith("sgl_amd_mono/") and (p := package_of(f))
+    }
+    tests = {p for f in changed if f.startswith("test/") and (p := package_of(f))}
+
+    def changed_in(m, pkgs):
+        return ", ".join(sorted(set(m["packages"]) & pkgs))
+
     models = {
-        key: (f"{', '.join(sorted(set(m['packages']) & touched))} changed", "full")
+        key: (f"{changed_in(m, tests)} tests changed", "tests")
         for key, m in MODELS.items()
-        if set(m["packages"]) & touched
+        if set(m["packages"]) & tests
     }
     shared = sorted({f for f in changed if f.startswith(SHARED_PATHS)})
     if shared:
         why = f"shared code changed ({', '.join(shared[:3])})"
-        models = {
-            "common": (why, "full"),
-            **{k: (why, "smoke") for k in MODELS},
-            **models,
+        models = {"common": (why, "full"), **{k: (why, "smoke") for k in MODELS}}
+    models.update(
+        {
+            key: (f"{changed_in(m, code)} changed", "full")
+            for key, m in MODELS.items()
+            if set(m["packages"]) & code
         }
+    )
     return models or {"common": ("no model package changed", "full")}
 
 

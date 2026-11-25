@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next with --monokernel-backend amd on one MI355X: NEXTN verify
+"""Qwen3.8-Flash-Next with --enable-amd-monokernel on one MI355X: NEXTN verify
 steps of up to 8 requests x 4 tokens run the 13 launches. The startup line shows
 the tested batches run them; batches step past the largest width and back (GSM8K
 at 16 requests), the accept length holds, the tokens of covered steps are scored
@@ -31,7 +31,6 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from sgl_amd_mono import BACKEND
 from sgl_amd_mono.qwen38_flash_next.spec import NUMERICS
 
 # a cold FlyDSL cache compiles each batch size's launches at its first forward
@@ -58,7 +57,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )

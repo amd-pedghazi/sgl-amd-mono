@@ -268,19 +268,27 @@ def test_a_routed_step_returns_the_tails_logits():
     assert lp._get_logits(rows[:2], None, meta).flatten().tolist() == [3, 7]
 
 
-class _ReplicatedLinear(torch.nn.Module):
-    """A quantized eh_proj, as SGLang builds it for a Quark checkpoint."""
-
-
 class UnquantizedLinearMethod:
     pass
 
 
-class _UnquantizedReplicated(torch.nn.Module):
-    """An unquantized ReplicatedLinear eh_proj (GLM-5.2's Quark checkpoint)."""
+class QuarkLinearMethod:
+    pass
 
-    quant_method = UnquantizedLinearMethod()
-    bias = None
+
+def _replicated(method):
+    # the draft spec reads SGLang's class names, so the fakes carry them
+    return type(
+        "ReplicatedLinear",
+        (torch.nn.Module,),
+        {"quant_method": method(), "bias": None},
+    )
+
+
+# a quantized eh_proj, as SGLang builds it for a Quark checkpoint
+_ReplicatedLinear = _replicated(QuarkLinearMethod)
+# an unquantized ReplicatedLinear eh_proj (GLM-5.2's Quark checkpoint)
+_UnquantizedReplicated = _replicated(UnquantizedLinearMethod)
 
 
 def _moe(dtype=torch.float8_e4m3fn):
